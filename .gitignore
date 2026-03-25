@@ -1,0 +1,85 @@
+# ============================================================
+#  .gitignore — MyoTensor Tesis (monorepo raíz)
+#  Cubre: PlatformIO, Python, Jupyter, VSCode, OS
+# ============================================================
+
+# ─── PlatformIO ────────────────────────────────────────────
+# De cada proyecto firmware solo se sube: include/, src/, platformio.ini
+**/.pio/
+**/libdeps/
+**/.vscode/
+firmware/**/lib/
+firmware/**/test/
+
+# ─── Python ────────────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.env
+.venv/
+env/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+
+# ─── Jupyter ───────────────────────────────────────────────
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# ─── Conda ─────────────────────────────────────────────────
+*.conda
+*.tar.gz
+conda-meta/
+
+# ─── Datos y modelos entrenados ────────────────────────────
+# Archivos grandes: subir solo con Git LFS si se necesitan
+*.csv
+*.npy
+*.npz
+*.h5
+*.tflite
+*.pkl
+*.pt
+*.pth
+# Excepción: modelos de referencia versionados explícitamente
+# !intelligence/models/baseline.tflite
+
+# ─── Registros y salidas temporales ────────────────────────
+*.log
+*.out
+logs/
+runs/
+output/
+results/
+
+# ─── Hardware / KiCad ──────────────────────────────────────
+hardware/**/*.bak
+hardware/**/*-backups/
+hardware/**/_autosave*
+hardware/**/fp-info-cache
+
+# ─── VSCode (workspace) ────────────────────────────────────
+.vscode/settings.json
+.vscode/tasks.json
+.vscode/extensions.json
+*.code-workspace
+
+# ─── Sistema operativo ─────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# ─── Carpetas excluidas del proyecto ───────────────────────
+conceptos/
+intelligence/datasets/raw/
+firmware/plotter_emg/
+docs/references/
+*.bin
