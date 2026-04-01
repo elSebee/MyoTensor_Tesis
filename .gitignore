@@ -83,3 +83,6 @@ intelligence/datasets/raw/
 firmware/plotter_emg/
 docs/references/
 *.bin
+
+# ─── Credenciales WiFi ─────────────────────────────────────
+firmware/**/include/secrets.h

@@ -3,18 +3,18 @@
 =============================================================
  emg_monitor.py — Monitor EMG en tiempo real | MyoTensor
 =============================================================
- Recibe datos CSV del ESP32-S3 via Serial @ 921600 baud
+ Recibe datos CSV del ESP32-S3 via WiFi UDP Broadcast
  y los grafica en tiempo real con pyqtgraph.
 
- Formato Serial esperado del firmware:
+ Formato UDP esperado del firmware (mismo que antes via Serial):
    timestamp_us,raw,centered,filtered,rectified,voltage_v
 
  Uso:
-   python emg_monitor.py                  # auto-detecta puerto
-   python emg_monitor.py --port /dev/ttyACM0
+   python emg_monitor.py                  # escucha en UDP_PORT
+   python emg_monitor.py --port 5005      # sobrescribir puerto
 
  Dependencias:
-   pip install pyqtgraph pyserial PyQt5 numpy
+   pip install pyqtgraph PyQt5 numpy
 =============================================================
 """
 
@@ -22,18 +22,17 @@ import sys
 import argparse
 import threading
 import time
+import socket
 from collections import deque
 
-import serial
-import serial.tools.list_ports
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 # ─────────────────────────────────────────────
-#  Constantes de visualizacion
+#  Constantes
 # ─────────────────────────────────────────────
-BAUD_RATE = 921600
+UDP_PORT  = 5005         # debe coincidir con UDP_PORT en config.h
 FS_HZ     = 1000         # muestras por segundo del firmware
 WINDOW_S  = 5.0          # segundos visibles en pantalla
 WINDOW_N  = int(FS_HZ * WINDOW_S)
@@ -47,21 +46,6 @@ COLORS = {
     "rectified": "#f78166",  # salmon
     "voltage_v": "#d2a8ff",  # violeta
 }
-
-# ─────────────────────────────────────────────
-#  Auto-deteccion de puerto serie
-# ─────────────────────────────────────────────
-def auto_detect_port() -> str:
-    keywords = ["CP210", "CH340", "FTDI", "USB Serial", "ACM", "usbserial"]
-    ports = serial.tools.list_ports.comports()
-    for p in ports:
-        desc = (p.description or "") + (p.manufacturer or "")
-        if any(k.lower() in desc.lower() for k in keywords):
-            return p.device
-    if ports:
-        return ports[-1].device
-    raise RuntimeError("No se encontro ningun puerto serie. Conecte el ESP32-S3")
-
 
 # ─────────────────────────────────────────────
 #  Buffer compartido entre hilos
@@ -86,53 +70,84 @@ class DataBuffer:
 
 
 # ─────────────────────────────────────────────
-#  Hilo de lectura Serial (no bloquea el UI)
+#  Hilo de recepcion WiFi UDP (reemplaza SerialReader)
 # ─────────────────────────────────────────────
-class SerialReader(threading.Thread):
-    def __init__(self, port: str, buf: DataBuffer):
-        super().__init__(daemon=True, name="SerialReader")
+class WiFiReader(threading.Thread):
+    """Escucha paquetes UDP en 0.0.0.0:UDP_PORT y los parsea como CSV.
+    Drop-in replacement de SerialReader.
+    """
+    def __init__(self, port: int, buf: DataBuffer):
+        super().__init__(daemon=True, name="WiFiReader")
         self.port      = port
         self.buf       = buf
         self._stop     = threading.Event()
         self.connected = False
         self.error_msg = ""
+        self._first_packet = True
+        self._last_log     = time.time()
+        self._last_count   = 0
 
     def run(self):
         try:
-            ser = serial.Serial(self.port, BAUD_RATE, timeout=1)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.bind(("", self.port))
+            sock.settimeout(1.0)   # wake each second para chequear _stop
             self.connected = True
-            print(f"[OK] Conectado a {self.port} @ {BAUD_RATE} baud")
-        except serial.SerialException as e:
+            print(f"[OK] Escuchando UDP en 0.0.0.0:{self.port}")
+        except OSError as e:
             self.error_msg = str(e)
             print(f"[ERROR] {e}")
             return
 
+        residuo = ""   # fragmento incompleto de linea entre paquetes
         while not self._stop.is_set():
             try:
-                raw_line = ser.readline()
-                if not raw_line:
-                    continue
-                line = raw_line.decode("utf-8", errors="ignore").strip()
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError as e:
+                print(f"[ERROR] UDP: {e}")
+                break
 
-                # Ignorar cabeceras, mensajes de boot y lineas vacias
+            # Un paquete puede contener 0, 1 o varias lineas CSV
+            texto = residuo + data.decode("utf-8", errors="ignore")
+            lineas = texto.split("\n")
+            residuo = lineas[-1]   # ultima parte (puede estar incompleta)
+
+            for line in lineas[:-1]:
+                line = line.strip()
                 if not line or line.startswith(("#", "[", ">")):
                     continue
-
                 parts = line.split(",")
                 if len(parts) != len(COLUMNS):
                     self.buf.drops += 1
                     continue
+                try:
+                    row = {col: float(parts[i]) for i, col in enumerate(COLUMNS)}
+                    self.buf.push(row)
 
-                row = {col: float(parts[i]) for i, col in enumerate(COLUMNS)}
-                self.buf.push(row)
+                    # ── Primer paquete recibido ──────────────────────
+                    if self._first_packet:
+                        self._first_packet = False
+                        print(f"[OK] ¡Conexión exitosa! Datos recibidos desde {addr[0]}:{addr[1]}")
+                        print(f"     Formato: {', '.join(COLUMNS)}")
 
-            except (ValueError, UnicodeDecodeError):
-                self.buf.drops += 1
-            except serial.SerialException as e:
-                print(f"[ERROR] Serial: {e}")
-                break
+                    # ── Log periódico cada 5 s ───────────────────────
+                    now = time.time()
+                    if now - self._last_log >= 5.0:
+                        delta   = self.buf.total_samples - self._last_count
+                        rate    = delta / (now - self._last_log)
+                        print(f"[UDP] {self.buf.total_samples} muestras | "
+                              f"{rate:.0f} Hz | drops: {self.buf.drops}")
+                        self._last_log   = now
+                        self._last_count = self.buf.total_samples
 
-        ser.close()
+                except ValueError:
+                    self.buf.drops += 1
+
+        sock.close()
 
     def stop(self):
         self._stop.set()
@@ -142,7 +157,7 @@ class SerialReader(threading.Thread):
 #  Ventana principal pyqtgraph
 # ─────────────────────────────────────────────
 class EMGMonitor:
-    def __init__(self, buf: DataBuffer, reader: SerialReader):
+    def __init__(self, buf: DataBuffer, reader: WiFiReader):
         self.buf    = buf
         self.reader = reader
 
@@ -221,15 +236,15 @@ class EMGMonitor:
 # ─────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="MyoTensor — EMG Monitor")
-    parser.add_argument("--port", type=str, default=None,
-                        help="Puerto serie (ej: /dev/ttyACM0)")
+    parser.add_argument("--port", type=int, default=UDP_PORT,
+                        help=f"Puerto UDP de escucha (default: {UDP_PORT})")
     args = parser.parse_args()
 
-    port = args.port or auto_detect_port()
-    print(f"[INFO] Puerto: {port}")
+    print(f"[INFO] Modo WiFi UDP | escuchando en 0.0.0.0:{args.port}")
+    print(f"[INFO] El ESP32 debe estar en la misma red LAN")
 
     buf    = DataBuffer(WINDOW_N)
-    reader = SerialReader(port, buf)
+    reader = WiFiReader(args.port, buf)
     reader.start()
 
     time.sleep(0.5)

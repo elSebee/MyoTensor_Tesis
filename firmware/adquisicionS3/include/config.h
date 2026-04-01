@@ -62,3 +62,37 @@
 // #define SERVO_MIN_US       500
 // #define SERVO_MAX_US       2500
 // #define PCA_TICKS          4096
+
+// ============================================================
+// WIFI / UDP — Streaming EMG
+// ============================================================
+//  Broadcast UDP: el ESP manda a 255.255.255.255:UDP_PORT
+//  Python escucha en 0.0.0.0:UDP_PORT — no requiere IP fija del PC.
+//  Timeout de conexion WiFi: si no conecta en WIFI_TIMEOUT_MS ms,
+//  el sistema aborta y entra en loop de error.
+// ============================================================
+#define UDP_PORT          5005
+#define UDP_BROADCAST_IP  "255.255.255.255"
+#define WIFI_TIMEOUT_MS   15000   // 15 s maximo esperando conexion
+
+// ============================================================
+// MODO DATASET — constantes exclusivas de recoleccion de datos
+// ------------------------------------------------------------
+//  Activo solo cuando se compila con -D DATASET_MODE
+//  (entorno 'dataset' en platformio.ini)
+// ============================================================
+#ifdef DATASET_MODE
+
+// Struct que viaja por la Queue de Core 1 → Core 0
+struct EMGSample {
+  uint32_t timestamp_us;
+  int      raw;
+  float    centered;
+  float    filtered;
+  float    voltage;
+};
+
+#define DATASET_QUEUE_SIZE   128   // elementos en la Queue (~128ms @ 1kHz)
+#define DATASET_UDP_BATCH     25   // muestras por paquete UDP
+
+#endif // DATASET_MODE

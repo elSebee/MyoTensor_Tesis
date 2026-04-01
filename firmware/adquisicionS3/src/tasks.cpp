@@ -2,8 +2,15 @@
  * ============================================================
  *  tasks.cpp — Tasks FreeRTOS y estado compartido entre cores
  * ============================================================
- *  Core 1 — taskAcquisicion : ADC + DSP a 1kHz → Serial CSV
- *  Core 0 — taskInferencia  : [INACTIVA] esperando modelo .tflite
+ *
+ *  Modo Inferencia (default):
+ *    Core 1 — taskAcquisicion : ADC + DSP a 1kHz → PSRAM + UDP
+ *    Core 0 — taskInferencia  : [INACTIVA] esperando .tflite
+ *
+ *  Modo Dataset (-D DATASET_MODE):
+ *    Core 1 — taskAcquisicion : ADC + DSP a 1kHz → FreeRTOS Queue
+ *    Core 0 — taskUDP         : drena Queue → batch UDP broadcast
+ *
  * ============================================================
  */
 
@@ -11,9 +18,129 @@
 #include "config.h"
 #include "adc.h"
 #include "dsp.h"
+#include <WiFiUdp.h>
+
+// Socket UDP — definido aqui, compartido por ambos modos
+WiFiUDP udp;
+
+// ############################################################
+// #                    MODO DATASET                          #
+// ############################################################
+#ifdef DATASET_MODE
 
 // ============================================================
-// Estado compartido entre cores — definicion
+// Estado compartido — Queue de Core 1 → Core 0
+// ============================================================
+QueueHandle_t xEMGQueue = nullptr;
+
+// ============================================================
+// tasksInit — Crear Queue (sin PSRAM, sin semaforos)
+// ============================================================
+bool tasksInit() {
+  xEMGQueue = xQueueCreate(DATASET_QUEUE_SIZE, sizeof(EMGSample));
+  if (!xEMGQueue) {
+    Serial.println("[ERROR] Fallo al crear xEMGQueue.");
+    return false;
+  }
+  Serial.printf("[OK] Queue creada: %d slots x %d bytes = %d bytes\n",
+                DATASET_QUEUE_SIZE, (int)sizeof(EMGSample),
+                DATASET_QUEUE_SIZE * (int)sizeof(EMGSample));
+  return true;
+}
+
+// ============================================================
+// CORE 1 — taskAcquisicion (modo dataset)
+// ============================================================
+// Pipeline DSP identico al modo inferencia.
+// En lugar de escribir a PSRAM, encola un EMGSample hacia Core 0.
+// Si la cola esta llena, descarta silenciosamente (non-blocking).
+//
+// Formato CSV generado por Core 0 (taskUDP):
+//   timestamp_us,raw,centered,filtered,voltage_v
+// ============================================================
+void taskAcquisicion(void* pvParameters) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xPeriod = pdMS_TO_TICKS(1000 / FS_HZ);
+
+  Serial.println("[ACQ] Core 1 — adquisicion dataset @ 1kHz");
+
+  for (;;) {
+    // 1. Leer ADC
+    int   raw    = readADC(EMG_CHANNEL);
+    float signal = (float)raw;
+
+    // 2. Centrar en 0
+    float centered = signal - DC_OFFSET;
+
+    // 3. Pipeline DSP
+    float notched  = notch(centered);
+    float highpass = hpf(notched);
+    float filtered = lpf(highpass);
+
+    // 4. Tension (voltios)
+    float voltage = (raw * VREF_ADC) / ADC_RES;
+
+    // 5. Encolar hacia Core 0 (non-blocking)
+    EMGSample sample = {
+      .timestamp_us = (uint32_t)micros(),
+      .raw          = raw,
+      .centered     = centered,
+      .filtered     = filtered,
+      .voltage      = voltage
+    };
+    xQueueSend(xEMGQueue, &sample, 0);  // descarta si llena
+
+    // 6. Esperar hasta el proximo tick — sin drift
+    vTaskDelayUntil(&xLastWakeTime, xPeriod);
+  }
+}
+
+// ============================================================
+// CORE 0 — taskUDP (modo dataset)
+// ============================================================
+// Drena la Queue y acumula muestras en un buffer de texto CSV.
+// Cada DATASET_UDP_BATCH muestras, envia un paquete UDP broadcast.
+// Toda la carga WiFi/lwIP se ejecuta en Core 0, dejando Core 1
+// libre para mantener el timing critico de 1kHz.
+//
+// CSV: timestamp_us,raw,centered,filtered,voltage_v
+// ============================================================
+void taskUDP(void* pvParameters) {
+  // Buffer local para batch (~55 bytes por linea CSV)
+  char batchBuf[DATASET_UDP_BATCH * 58];
+  int  batchLen = 0;
+  int  batchCnt = 0;
+
+  Serial.println("[UDP] Core 0 — streaming dataset por UDP");
+
+  for (;;) {
+    EMGSample s;
+    // Bloquea hasta que hay una muestra — no consume CPU en espera
+    if (xQueueReceive(xEMGQueue, &s, portMAX_DELAY) == pdTRUE) {
+      batchLen += snprintf(batchBuf + batchLen, sizeof(batchBuf) - batchLen,
+                           "%lu,%d,%.2f,%.2f,%.4f\n",
+                           (unsigned long)s.timestamp_us,
+                           s.raw, s.centered, s.filtered, s.voltage);
+      batchCnt++;
+
+      if (batchCnt >= DATASET_UDP_BATCH) {
+        udp.beginPacket(UDP_BROADCAST_IP, UDP_PORT);
+        udp.write((const uint8_t*)batchBuf, batchLen);
+        udp.endPacket();
+        batchLen = 0;
+        batchCnt = 0;
+      }
+    }
+  }
+}
+
+// ############################################################
+// #                   MODO INFERENCIA                        #
+// ############################################################
+#else
+
+// ============================================================
+// Estado compartido entre cores — definicion (modo inferencia)
 // ============================================================
 float*            circBuffer  = nullptr;
 float*            inferBuf    = nullptr;
@@ -51,46 +178,29 @@ bool tasksInit() {
 // ============================================================
 // CORE 0 — taskInferencia  [INACTIVA — sin modelo .tflite]
 // ============================================================
-// La task existe pero bloquea esperando el semaforo indefinidamente.
-// No consume CPU. Se activa al integrar TFLite en la proxima etapa.
-// Para reactivar: descomentar el bloque de inferencia y conectar
-// el interprete de TFLite.
-// ============================================================
 void taskInferencia(void* pvParameters) {
   Serial.println("[INF] Task inferencia en espera — modelo .tflite no cargado.");
   for (;;) {
-    // Drena el semaforo sin hacer nada — evita que se acumule
     xSemaphoreTake(xWindowReady, portMAX_DELAY);
-
-    // [PLACEHOLDER] Reemplazar con:
-    //   tflInterpreter->SetInput(inferBuf, WINDOW_SIZE);
-    //   tflInterpreter->Invoke();
-    //   int gesto = tflInterpreter->GetOutput();
-    //   setServoAngle(gestureMap[gesto], angleMap[gesto]);
-
-    // Por ahora solo libera el mutex rapidamente para no bloquear Core 1
     vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
 // ============================================================
-// CORE 1 — taskAcquisicion
+// CORE 1 — taskAcquisicion (modo inferencia)
 // ============================================================
-// Timing via vTaskDelayUntil() — mas preciso que polling con micros().
-// El scheduler de FreeRTOS garantiza el periodo SAMPLE_US sin drift
-// acumulado. El output CSV es parseado directamente por Python.
-//
-// Formato Serial (una linea por muestra):
-//   timestamp_us,raw,centered,filtered,rectified,voltage_v
-// ============================================================
+#define N_UDP_BATCH    25
+#define UDP_DECIMATION  1
+
 void taskAcquisicion(void* pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
-
-  // Periodo en ticks FreeRTOS (tick = 1ms por defecto en ESP-IDF)
-  // A 1kHz, SAMPLE_US = 1000us = 1ms = exactamente 1 tick
   const TickType_t xPeriod = pdMS_TO_TICKS(1000 / FS_HZ);
 
-  // Cabecera CSV — Python la usa para nombrar columnas
+  char udpBatch[N_UDP_BATCH * 68];
+  int  udpLen    = 0;
+  int  batchCnt  = 0;
+  int  decimCnt  = 0;
+
   Serial.println("# timestamp_us,raw,centered,filtered,rectified,voltage_v");
 
   for (;;) {
@@ -125,12 +235,27 @@ void taskAcquisicion(void* pvParameters) {
       xSemaphoreGive(xWindowReady);
     }
 
-    // 8. Output CSV — timestamp, raw, centered, filtered, rect, voltios
-    // Formato compacto para minimizar bytes en serial a 921600
-    Serial.printf("%lu,%d,%.2f,%.2f,%.2f,%.4f\n",
-                  micros(), raw, centered, filtered, rectified, voltage);
+    // 8. Acumular en batch
+    if (++decimCnt >= UDP_DECIMATION) {
+      decimCnt = 0;
+      udpLen += snprintf(udpBatch + udpLen, sizeof(udpBatch) - udpLen,
+                         "%lu,%d,%.2f,%.2f,%.2f,%.4f\n",
+                         micros(), raw, centered, filtered, rectified, voltage);
+      batchCnt++;
 
-    // 9. Esperar hasta el proximo tick (1ms) — sin drift acumulado
+      // 9. Enviar batch
+      if (batchCnt >= N_UDP_BATCH) {
+        udp.beginPacket(UDP_BROADCAST_IP, UDP_PORT);
+        udp.write((const uint8_t*)udpBatch, udpLen);
+        udp.endPacket();
+        udpLen   = 0;
+        batchCnt = 0;
+      }
+    }
+
+    // 10. Esperar hasta el proximo tick (1ms) — sin drift acumulado
     vTaskDelayUntil(&xLastWakeTime, xPeriod);
   }
 }
+
+#endif // DATASET_MODE

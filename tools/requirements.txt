@@ -1,5 +1,16 @@
 # MyoTensor — tools/requirements.txt
-pyserial>=3.5
-pyqtgraph>=0.13.3
+# Instalar con: pip install -r requirements.txt
+
+# ── Interfaz gráfica y visualización ──────────────────────────
 PyQt5>=5.15
-numpy>=1.24
+pyqtgraph>=0.13.3      # gráfico EMG en tiempo real (monitor + colector)
+
+# ── Datos y procesamiento ──────────────────────────────────────
+numpy>=1.24             # buffers, aritmética de señal
+pandas>=2.0             # escritura CSV y post-proceso (restimulus)
+
+# ── Configuración del protocolo ────────────────────────────────
+PyYAML>=6.0             # lectura de protocol.yaml
+
+# ── Comunicación (legacy / debug serial) ──────────────────────
+pyserial>=3.5
