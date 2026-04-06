@@ -1,0 +1,37 @@
+# ============================================================
+#  protocol.yaml — Configuracion del protocolo de adquisicion
+# ============================================================
+#  Modificar estos valores para ajustar el protocolo sin tocar
+#  el codigo fuente. El script main.py lee este archivo al inicio.
+# ============================================================
+
+protocol:
+  repetitions: 2             # repeticiones por gesto
+  gesture_duration_s: 5.0    # segundos de activacion muscular
+  rest_duration_s: 3.0       # segundos de reposo entre reps
+  countdown_s: 3             # cuenta regresiva antes de empezar
+  reaction_time_ms: 250      # offset para restimulus (post-proceso)
+
+# Gestos en orden secuencial de ejecucion
+# id: etiqueta numerica en el CSV (0 = reposo, se genera automaticamente)
+gestures:
+  - id: 1
+    name: palma
+    label: "ABRE LA MANO"
+    image: palma.gif
+
+  - id: 2
+    name: puno
+    label: "CIERRA EL PUÑO"
+    image: puno.gif
+
+  - id: 3
+    name: paz
+    label: "HAZ PAZ"
+    image: paz.gif
+
+network:
+  port: 5005
+
+output:
+  base_dir: "../../intelligence/datasets/raw/myotensor_proto"
