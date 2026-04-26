@@ -76,23 +76,7 @@
 #define WIFI_TIMEOUT_MS   15000   // 15 s maximo esperando conexion
 
 // ============================================================
-// MODO DATASET — constantes exclusivas de recoleccion de datos
-// ------------------------------------------------------------
-//  Activo solo cuando se compila con -D DATASET_MODE
-//  (entorno 'dataset' en platformio.ini)
+// MODO DATASET — ver proyecto Streamer
 // ============================================================
-#ifdef DATASET_MODE
-
-// Struct que viaja por la Queue de Core 1 → Core 0
-struct EMGSample {
-  uint32_t timestamp_us;
-  int      raw;
-  float    centered;
-  float    filtered;
-  float    voltage;
-};
-
-#define DATASET_QUEUE_SIZE   128   // elementos en la Queue (~128ms @ 1kHz)
-#define DATASET_UDP_BATCH     25   // muestras por paquete UDP
-
-#endif // DATASET_MODE
+// La struct EMGSample, DATASET_QUEUE_SIZE y DATASET_UDP_BATCH
+// viven en firmware/Streamer/include/config.h

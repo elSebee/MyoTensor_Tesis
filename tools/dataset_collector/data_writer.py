@@ -1,6 +1,6 @@
 """
 =============================================================
- data_writer.py — Acumula muestras en RAM y guarda al final
+ data_writer.py — Acumula muestras y guarda al final
 =============================================================
  Registra un callback en UDPReceiver. Solo acumula muestras
  cuando el ProtocolEngine esta en estado GESTURE o REST
@@ -8,8 +8,15 @@
 
  Al recibir la señal finished del engine:
    1. Vuelca todos los datos a un CSV
-   2. Guarda session_metadata.json
-   3. Ejecuta postprocess para agregar restimulus
+   2. Guarda session_metadata.json (incluye calibracion)
+   3. Ejecuta run_postprocess para agregar restimulus y valid_flag
+
+ Columnas del CSV (protocolo binario):
+   timestamp_us, filtered, emg_norm,
+   stimulus, set_id, repetition_id
+
+ NOTA: raw, centered y voltage_v ya no llegan del firmware
+ (protocolo binario optimizado). emg_norm se calcula en post.
 =============================================================
 """
 
@@ -17,28 +24,42 @@ import json
 import os
 from datetime import datetime
 
-from postprocess import add_restimulus
+from postprocess import run_postprocess
 
 
 class DataWriter:
     """Acumula muestras EMG etiquetadas y las guarda al finalizar."""
 
     def __init__(self, engine, config: dict, subject_info: dict, output_dir: str):
-        self.engine = engine
-        self.config = config
+        self.engine      = engine
+        self.config      = config
         self.subject_info = subject_info
-        self.output_dir = output_dir
+        self.output_dir  = output_dir
 
-        # Acumulador en RAM (~13MB para sesion completa — sin problema)
-        self.samples = []
+        # Resultado de calibracion (se setea via set_calibration antes de grabar)
+        self.calibration: dict = {}
+
+        # Acumulador en RAM
+        self.samples: list = []
         self.session_start = None
 
-    def on_sample(self, sample: dict):
-        """Callback invocado desde el hilo UDP por cada muestra.
+    # ── API publica ────────────────────────────────────────────
 
+    def set_calibration(self, result: dict):
+        """Recibir resultado de calibracion desde el Calibrator.
+
+        Llamar antes de que empiece el protocolo de adquisicion.
+        """
+        self.calibration = result or {}
+        mvc = self.calibration.get("mvc_voltage_v", 1.0)
+        thr = self.calibration.get("onset_threshold_v", 0.0)
+        print(f"[WRITER] Calibracion recibida — MVC: {mvc:.4f}V | Umbral: {thr:.4f}V")
+
+    def on_batch(self, timestamps, filtered_arr):
+        """Callback invocado desde el hilo UDP por cada batch de muestras.
+
+        Recibe arrays numpy con N muestras (tipicamente N=50).
         Solo registra si el engine esta grabando (GESTURE o REST).
-        Lee engine.recording, engine.stimulus, engine.repetition
-        que son atributos simples protegidos por el GIL de CPython.
         """
         if not self.engine.recording:
             return
@@ -46,15 +67,21 @@ class DataWriter:
         if self.session_start is None:
             self.session_start = datetime.now()
 
-        self.samples.append((
-            int(sample["timestamp_us"]),
-            int(sample["raw"]),
-            sample["centered"],
-            sample["filtered"],
-            sample["voltage_v"],
-            self.engine.stimulus,
-            self.engine.repetition,
-        ))
+        mvc_v = self.calibration.get("mvc_voltage_v", 0.0)
+
+        for ts, filtered in zip(timestamps, filtered_arr):
+            # emg_norm: señal filtrada normalizada por el pico MVC.
+            # Si no hay calibracion, emg_norm == filtered (sin escala).
+            emg_norm = float(filtered) / mvc_v if mvc_v > 1e-6 else float(filtered)
+
+            self.samples.append((
+                int(ts),
+                float(filtered),
+                emg_norm,
+                self.engine.stimulus,
+                self.engine.set_id,
+                self.engine.repetition_id,
+            ))
 
     def save(self) -> tuple:
         """Volcar datos a disco. Retorna (csv_path, meta_path).
@@ -66,37 +93,46 @@ class DataWriter:
             return None, None
 
         subject_id = self.subject_info.get("subject_id", "S00")
-        subdir = os.path.join(self.output_dir, subject_id)
+        subdir     = os.path.join(self.output_dir, subject_id)
         os.makedirs(subdir, exist_ok=True)
 
-        ts = self.session_start.strftime("%Y%m%d_%H%M%S")
-        csv_path = os.path.join(subdir, f"session_{ts}.csv")
+        ts        = self.session_start.strftime("%Y%m%d_%H%M%S")
+        csv_path  = os.path.join(subdir, f"session_{ts}.csv")
         meta_path = os.path.join(subdir, f"session_{ts}_metadata.json")
 
-        # ── Escribir CSV ─────────────────────────────────────
-        header = "timestamp_us,raw,centered,filtered,voltage_v,stimulus,repetition\n"
+        # ── Escribir CSV ────────────────────────────────────
+        header = "timestamp_us,filtered,emg_norm,stimulus,set_id,repetition_id\n"
         with open(csv_path, "w") as f:
             f.write(header)
             for s in self.samples:
-                f.write(f"{s[0]},{s[1]},{s[2]:.2f},{s[3]:.2f},"
-                        f"{s[4]:.4f},{s[5]},{s[6]}\n")
+                f.write(
+                    f"{s[0]},{s[1]:.4f},{s[2]:.6f},{s[3]},{s[4]},{s[5]}\n"
+                )
 
         n = len(self.samples)
         print(f"[OK] CSV guardado: {csv_path} ({n} muestras, {n/1000:.1f}s)")
 
-        # ── Escribir metadata ────────────────────────────────
+        # ── Escribir metadata ─────────────────────────────────
+        onset_cfg = self.config.get("onset", {})
         meta = {
             **self.subject_info,
-            "date": self.session_start.isoformat(),
-            "fs_hz": 1000,
-            "total_samples": n,
-            "duration_s": round(n / 1000.0, 2),
-            "gestures": [g["name"] for g in self.config["gestures"]],
-            "gesture_ids": {g["name"]: g["id"] for g in self.config["gestures"]},
-            "repetitions": self.config["protocol"]["repetitions"],
+            "date":               self.session_start.isoformat(),
+            "fs_hz":              1000,
+            "total_samples":      n,
+            "duration_s":         round(n / 1000.0, 2),
+            "gestures":           [g["name"] for g in self.engine._base_gestures],
+            "gesture_ids":        {g["name"]: g["id"] for g in self.engine._base_gestures},
+            "n_sets":             self.config["protocol"].get("n_sets", 10),
             "gesture_duration_s": self.config["protocol"]["gesture_duration_s"],
-            "rest_duration_s": self.config["protocol"]["rest_duration_s"],
-            "reaction_time_offset_ms": self.config["protocol"]["reaction_time_ms"],
+            "rest_duration_s":    self.config["protocol"]["rest_duration_s"],
+            "prep_duration_s":    self.config["protocol"].get("prep_duration_s", 2.0),
+            "randomized_order":   True,
+            "calibration":        self.calibration,
+            "onset_config":       {
+                "rms_window_ms":    onset_cfg.get("rms_window_ms", 100),
+                "threshold_factor": onset_cfg.get("threshold_factor", 3.0),
+                "min_active_ms":    onset_cfg.get("min_active_ms", 200),
+            },
             "csv_file": os.path.basename(csv_path),
         }
         with open(meta_path, "w") as f:
@@ -104,9 +140,8 @@ class DataWriter:
 
         print(f"[OK] Metadata guardado: {meta_path}")
 
-        # ── Post-proceso: agregar restimulus ──────────────────
-        rt = self.config["protocol"]["reaction_time_ms"]
-        add_restimulus(csv_path, reaction_time_ms=rt)
+        # ── Post-proceso: restimulus dinamico + valid_flag ────
+        run_postprocess(csv_path, meta_path)
 
         return csv_path, meta_path
 
@@ -114,4 +149,4 @@ class DataWriter:
         """Limpiar para una nueva sesion."""
         self.samples.clear()
         self.session_start = None
-
+        self.calibration   = {}

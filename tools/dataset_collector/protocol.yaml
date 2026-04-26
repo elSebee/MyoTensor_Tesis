@@ -6,13 +6,21 @@
 # ============================================================
 
 protocol:
-  repetitions: 2             # repeticiones por gesto
-  gesture_duration_s: 5.0    # segundos de activacion muscular
-  rest_duration_s: 3.0       # segundos de reposo entre reps
-  countdown_s: 3             # cuenta regresiva antes de empezar
-  reaction_time_ms: 250      # offset para restimulus (post-proceso)
+  n_sets: 2                 # numero de bloques (Sets) de la sesion
+  gesture_duration_s: 5.0    # segundos de contraccion activa
+  rest_duration_s: 3.0       # segundos de reposo entre gestos
+  post_mvc_duration_s: 2.0   # pausa entre MVC y el primer set
 
-# Gestos en orden secuencial de ejecucion
+calibration:
+  noise_duration_s: 5.0      # segundos de reposo absoluto (ruido basal)
+  mvc_duration_s: 3.0        # segundos de contraccion voluntaria maxima (MVC)
+
+onset:
+  rms_window_ms: 100         # ventana de RMS para detectar onset (ms)
+  threshold_factor: 3.0      # N x std_noise para considerar gesto activo
+  min_active_ms: 200         # duracion minima valida de un gesto (ms)
+
+# Gestos en orden base (se aleatorizan si randomize_gestures = true)
 # id: etiqueta numerica en el CSV (0 = reposo, se genera automaticamente)
 gestures:
   - id: 1
