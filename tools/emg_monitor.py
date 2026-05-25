@@ -111,6 +111,16 @@ class WiFiReader(threading.Thread):
                 print(f"[ERROR] UDP: {e}")
                 break
 
+            if data == b"MYOTENSOR_PING":
+                try:
+                    reply_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    reply_sock.sendto(b"MYOTENSOR_PONG", (addr[0], self.port))
+                    reply_sock.close()
+                    print(f"[INFO] Discovery: Recibido PING de ESP32 ({addr[0]}). Enviado PONG.")
+                except Exception as e:
+                    print(f"[ERROR] Discovery error al responder PONG: {e}")
+                continue
+
             # Un paquete puede contener 0, 1 o varias lineas CSV
             texto = residuo + data.decode("utf-8", errors="ignore")
             lineas = texto.split("\n")

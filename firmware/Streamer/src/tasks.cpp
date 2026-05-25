@@ -27,6 +27,7 @@
 // Socket UDP
 // ============================================================
 WiFiUDP udp;
+IPAddress udp_target_ip;
 
 // Handle de taskUDP — asignado desde main.cpp
 TaskHandle_t hTaskUDP = nullptr;
@@ -57,6 +58,72 @@ bool tasksInit() {
                 (unsigned)sizeof(PacketHeader),
                 (unsigned)(BATCH_SIZE * sizeof(float)));
   return true;
+}
+
+// ============================================================
+// discoverTargetIP — Descubre la IP del PC receptor via handshake UDP
+// ============================================================
+bool discoverTargetIP() {
+  Serial.println("[Discovery] Iniciando auto-descubrimiento del PC...");
+  
+  // Configurar IP de fallback por si acaso
+  if (!udp_target_ip.fromString(UDP_TARGET_IP)) {
+    // Si no es un string valido de IP, por defecto usar broadcast general
+    udp_target_ip = IPAddress(255, 255, 255, 255);
+  }
+
+  // Timeout de 15 segundos para buscar
+  const uint32_t timeout_ms = 15000;
+  uint32_t start_time = millis();
+  uint32_t last_ping = 0;
+  
+  // Configurar LED para parpadeo rápido que indica búsqueda
+  #ifdef LED_BUILTIN
+  pinMode(LED_BUILTIN, OUTPUT);
+  #endif
+
+  while (millis() - start_time < timeout_ms) {
+    uint32_t now = millis();
+    
+    // Parpadeo rápido (50ms ON, 50ms OFF)
+    #ifdef LED_BUILTIN
+    digitalWrite(LED_BUILTIN, (now / 100) % 2 == 0 ? LOW : HIGH); // LOW enciende el LED en Xiao
+    #endif
+
+    // Enviar PING broadcast cada 1 segundo
+    if (now - last_ping >= 1000) {
+      last_ping = now;
+      Serial.printf("[Discovery] Enviando PING broadcast a puerto %d...\n", UDP_PORT);
+      
+      udp.beginPacket(IPAddress(255, 255, 255, 255), UDP_PORT);
+      udp.write((const uint8_t*)"MYOTENSOR_PING", 14);
+      udp.endPacket();
+    }
+
+    // Verificar si hay respuesta
+    int packetSize = udp.parsePacket();
+    if (packetSize > 0) {
+      char reply[32] = {0};
+      udp.read(reply, sizeof(reply) - 1);
+      
+      if (strcmp(reply, "MYOTENSOR_PONG") == 0) {
+        udp_target_ip = udp.remoteIP();
+        Serial.printf("[Discovery] ¡Exito! PC encontrado en IP: %s\n", udp_target_ip.toString().c_str());
+        #ifdef LED_BUILTIN
+        digitalWrite(LED_BUILTIN, LOW); // Dejar LED encendido fijo
+        #endif
+        return true;
+      }
+    }
+    
+    delay(10);
+  }
+
+  Serial.printf("[Discovery] Timeout alcanzado. Usando IP de fallback: %s\n", udp_target_ip.toString().c_str());
+  #ifdef LED_BUILTIN
+  digitalWrite(LED_BUILTIN, HIGH); // Apagar LED
+  #endif
+  return false;
 }
 
 // ============================================================
@@ -163,7 +230,7 @@ void taskUDP(void* pvParameters) {
       bool sent = false;
       for (int retry = 0; retry < 3 && !sent; retry++) {
         if (retry > 0) vTaskDelay(pdMS_TO_TICKS(2));
-        udp.beginPacket(UDP_TARGET_IP, UDP_PORT);
+        udp.beginPacket(udp_target_ip, UDP_PORT);
         udp.write(pkt, PKT_SIZE);
         sent = (udp.endPacket() != 0);
       }

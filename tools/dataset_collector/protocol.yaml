@@ -6,7 +6,7 @@
 # ============================================================
 
 protocol:
-  n_sets: 2                 # numero de bloques (Sets) de la sesion
+  n_sets: 10                 # numero de bloques (Sets) de la sesion
   gesture_duration_s: 5.0    # segundos de contraccion activa
   rest_duration_s: 3.0       # segundos de reposo entre gestos
   post_mvc_duration_s: 2.0   # pausa entre MVC y el primer set

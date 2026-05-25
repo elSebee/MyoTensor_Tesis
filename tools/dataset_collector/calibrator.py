@@ -74,9 +74,15 @@ class Calibrator(QObject):
         noise = np.array(self._noise_samples, dtype=np.float64)
         mvc   = np.array(self._mvc_samples,   dtype=np.float64)
 
-        noise_mean = float(np.mean(noise)) if len(noise) > 0 else 0.0
-        noise_std  = float(np.std(noise))  if len(noise) > 0 else 0.01
-        onset_threshold_v = noise_mean + self._threshold_factor * noise_std
+        if len(noise) > 0:
+            noise_abs = np.abs(noise)
+            noise_mean = float(np.mean(noise_abs))
+            noise_std  = float(np.std(noise_abs))
+            onset_threshold_v = noise_mean + self._threshold_factor * noise_std
+        else:
+            noise_mean = 0.0
+            noise_std  = 0.01
+            onset_threshold_v = 1.0
 
         if len(mvc) > 0:
             fs_approx = len(mvc) / self._mvc_dur

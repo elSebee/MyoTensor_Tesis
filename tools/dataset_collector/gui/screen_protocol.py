@@ -96,8 +96,8 @@ class ProtocolScreen(QWidget):
 
     # ── Slots publicos (conectados por MainWindow) ─────────────
 
-    def update_plot(self, data) -> None:
-        update_plot(self._plot, data)
+    def update_plot(self, data, n) -> None:
+        update_plot(self._plot, data, n)
 
     def on_state_changed(self, state_name: str, info: dict):
         """Actualizar UI segun el estado del protocolo."""

@@ -148,6 +148,16 @@ class UDPReceiver(threading.Thread):
                 print(f"[ERROR] UDP: {e}")
                 break
 
+            if data == b"MYOTENSOR_PING":
+                try:
+                    reply_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    reply_sock.sendto(b"MYOTENSOR_PONG", (addr[0], self.port))
+                    reply_sock.close()
+                    print(f"[INFO] Discovery: Recibido PING de ESP32 ({addr[0]}). Enviado PONG.")
+                except Exception as e:
+                    print(f"[ERROR] Discovery error al responder PONG: {e}")
+                continue
+
             self._parse_packet(data, addr)
 
         sock.close()
@@ -177,18 +187,26 @@ class UDPReceiver(threading.Thread):
 
         # Detectar perdida de paquetes (o reboot del ESP)
         if self._last_seq is not None:
-            gap = seq_num - self._last_seq - 1
-            if gap < 0:
-                # seq_num se reseteo → ESP reinicio, no contar como perdida
-                print(f"[INFO] ESP reiniciado (seq {self._last_seq} → {seq_num})")
-            elif gap > 0 and gap < 1000:
-                self.buf.pkt_loss += gap
-                lost_samples = gap * n_samples
-                print(f"[WARN] Paquetes perdidos: {gap} "
-                      f"(seq {self._last_seq+1}..{seq_num-1}) "
-                      f"≈ {lost_samples} muestras")
-            # gap >= 1000 → tambien probable reboot, ignorar
-        self._last_seq = seq_num
+            if seq_num < self._last_seq:
+                # O es un paquete desordenado (llego tarde) o el ESP se reinicio
+                if seq_num < 10 and self._last_seq > 100:
+                    print(f"[INFO] ESP reiniciado (seq {self._last_seq} → {seq_num})")
+                    self._last_seq = seq_num
+                else:
+                    # Paquete desordenado (out-of-order). Lo procesamos pero no retrocedemos
+                    # self._last_seq para evitar cascadas de falsos positivos en las perdidas.
+                    pass
+            else:
+                gap = seq_num - self._last_seq - 1
+                if gap > 0 and gap < 1000:
+                    self.buf.pkt_loss += gap
+                    lost_samples = gap * n_samples
+                    print(f"[WARN] Paquetes perdidos: {gap} "
+                          f"(seq {self._last_seq+1}..{seq_num-1}) "
+                          f"≈ {lost_samples} muestras")
+                self._last_seq = seq_num
+        else:
+            self._last_seq = seq_num
 
         # Deserializar payload: N floats contiguos
         fmt_payload = f"<{n_samples}f"

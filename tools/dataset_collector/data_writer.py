@@ -24,7 +24,7 @@ import json
 import os
 from datetime import datetime
 
-from postprocess import run_postprocess
+from preprocess import run_preprocess
 
 
 class DataWriter:
@@ -79,7 +79,6 @@ class DataWriter:
                 float(filtered),
                 emg_norm,
                 self.engine.stimulus,
-                self.engine.set_id,
                 self.engine.repetition_id,
             ))
 
@@ -101,12 +100,12 @@ class DataWriter:
         meta_path = os.path.join(subdir, f"session_{ts}_metadata.json")
 
         # ── Escribir CSV ────────────────────────────────────
-        header = "timestamp_us,filtered,emg_norm,stimulus,set_id,repetition_id\n"
+        header = "timestamp_us,filtered,emg_norm,stimulus,repetition_id\n"
         with open(csv_path, "w") as f:
             f.write(header)
             for s in self.samples:
                 f.write(
-                    f"{s[0]},{s[1]:.4f},{s[2]:.6f},{s[3]},{s[4]},{s[5]}\n"
+                    f"{s[0]},{s[1]:.4f},{s[2]:.6f},{s[3]},{s[4]}\n"
                 )
 
         n = len(self.samples)
@@ -140,8 +139,8 @@ class DataWriter:
 
         print(f"[OK] Metadata guardado: {meta_path}")
 
-        # ── Post-proceso: restimulus dinamico + valid_flag ────
-        run_postprocess(csv_path, meta_path)
+        # ── Pre-proceso: restimulus dinamico + valid_flag ────
+        run_preprocess(csv_path, meta_path)
 
         return csv_path, meta_path
 

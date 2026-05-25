@@ -55,12 +55,16 @@ extern volatile uint32_t g_dropped;   // muestras descartadas (ring lleno)
 
 // Socket UDP — definido en tasks.cpp
 extern WiFiUDP udp;
+extern IPAddress udp_target_ip;
 
 // Handle de taskUDP — usado por Core 1 para notificar via xTaskNotifyGive
 extern TaskHandle_t hTaskUDP;
 
 // Inicializa el ring buffer
 bool tasksInit();
+
+// Descubre la IP del PC receptor via handshake UDP
+bool discoverTargetIP();
 
 // Core 1: adquisicion EMG + DSP a 1kHz → ring buffer
 void taskAcquisicion(void* pvParameters);

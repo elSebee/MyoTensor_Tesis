@@ -25,7 +25,7 @@
 
 void setup() {
   Serial.begin(921600);
-  delay(500);
+  delay(3000); // Dar tiempo al Monitor Serial para conectarse
   Serial.println("\n=== Streamer — MyoTensor S3 ===");
 
   // --- Hardware ---
@@ -42,7 +42,8 @@ void setup() {
     ESP.restart();
   }
   wm.stopWebPortal();
-  Serial.printf("\n[OK] WiFi conectado — IP: %s | Portal detenido\n",
+  Serial.printf("\n[OK] WiFi conectado a %s — IP: %s | Portal detenido\n",
+                WiFi.SSID().c_str(),
                 WiFi.localIP().toString().c_str());
 
   // --- [FIX 1] Desactivar WiFi Power Save Mode ---
@@ -54,9 +55,20 @@ void setup() {
   esp_wifi_set_ps(WIFI_PS_NONE);
   Serial.println("[OK] WiFi Power Save desactivado (WIFI_PS_NONE)");
 
+  // --- [FIX 2] Reducir Potencia de Transmision ---
+  // Unicast introduce ACKs MAC-level. Estos picos de transmision (hasta 300mA)
+  // pueden causar caidas de voltaje en VCC e introducir "pulsos" en el ADC.
+  // Reducir la potencia a 8.5dBm limita el ruido RF y el consumo pico.
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  Serial.println("[OK] Potencia de TX reducida a 8.5dBm para proteger ADC");
+
   // --- UDP unicast ---
   udp.begin(UDP_PORT);
-  Serial.printf("[OK] UDP unicast listo — destino: %s:%d\n", UDP_TARGET_IP, UDP_PORT);
+
+  // --- Descubrimiento automatico de la IP del PC ---
+  discoverTargetIP();
+
+  Serial.printf("[OK] UDP unicast listo — destino: %s:%d\n", udp_target_ip.toString().c_str(), UDP_PORT);
 
   // --- Inicializar ring buffer SPSC ---
   if (!tasksInit()) {
@@ -99,7 +111,7 @@ void setup() {
                 (unsigned)(BATCH_SIZE * sizeof(float)));
   Serial.printf("    Batch     : %u muestras -> %u pkt/s\n",
                 BATCH_SIZE, (unsigned)(FS_HZ / BATCH_SIZE));
-  Serial.printf("    Destino   : %s:%d (unicast)\n", UDP_TARGET_IP, UDP_PORT);
+  Serial.printf("    Destino   : %s:%d (unicast)\n", udp_target_ip.toString().c_str(), UDP_PORT);
   Serial.println("    WiFi PS   : NONE (radio siempre activa)");
   Serial.println("    Core 1    : taskAcquisicion — ADC+DSP @ 1kHz");
   Serial.println("    Core 0    : taskUDP — binario + task notifications");
