@@ -14,14 +14,14 @@
  * ============================================================
  */
 
+#include "adc.h"
+#include "config.h"
+#include "secrets.h"
+#include "tasks.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <esp_wifi.h>
-#include "config.h"
-#include "secrets.h"
-#include "adc.h"
-#include "tasks.h"
 
 void setup() {
   Serial.begin(921600);
@@ -34,17 +34,22 @@ void setup() {
 
   // --- WiFi via WiFiManager ---
   WiFiManager wm;
+
+  // wm.resetSettings();
+
+  // configPortalTimeout: tiempo maximo en segundos que el ESP se queda como AP
+  // antes de reiniciar si no encuentra una red para conectarse.
   wm.setConfigPortalTimeout(180);
   Serial.println("[WiFi] Iniciando autoConnect...");
   if (!wm.autoConnect("MyoTensor_Streamer")) {
-    Serial.println("[ERROR] Fallo la conexion o se alcanzo el timeout del portal");
+    Serial.println(
+        "[ERROR] Fallo la conexion o se alcanzo el timeout del portal");
     delay(3000);
     ESP.restart();
   }
   wm.stopWebPortal();
   Serial.printf("\n[OK] WiFi conectado a %s — IP: %s | Portal detenido\n",
-                WiFi.SSID().c_str(),
-                WiFi.localIP().toString().c_str());
+                WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
 
   // --- [FIX 1] Desactivar WiFi Power Save Mode ---
   // Por defecto, ESP32 usa WIFI_PS_MIN_MODEM: la radio se apaga
@@ -68,35 +73,25 @@ void setup() {
   // --- Descubrimiento automatico de la IP del PC ---
   discoverTargetIP();
 
-  Serial.printf("[OK] UDP unicast listo — destino: %s:%d\n", udp_target_ip.toString().c_str(), UDP_PORT);
+  Serial.printf("[OK] UDP unicast listo — destino: %s:%d\n",
+                udp_target_ip.toString().c_str(), UDP_PORT);
 
   // --- Inicializar ring buffer SPSC ---
   if (!tasksInit()) {
     Serial.println("[FATAL] Fallo en tasksInit(). Sistema detenido.");
-    while (true) delay(1000);
+    while (true)
+      delay(1000);
   }
 
   // --- Core 1: Adquisicion EMG + DSP ---
-  xTaskCreatePinnedToCore(
-    taskAcquisicion,
-    "ACQ",
-    TASK_ACQ_STACK,
-    nullptr,
-    TASK_ACQ_PRIORITY,
-    nullptr,
-    TASK_ACQ_CORE
-  );
+  xTaskCreatePinnedToCore(taskAcquisicion, "ACQ", TASK_ACQ_STACK, nullptr,
+                          TASK_ACQ_PRIORITY, nullptr, TASK_ACQ_CORE);
 
   // --- Core 0: Streaming UDP (handle guardado para task notifications) ---
   xTaskCreatePinnedToCore(
-    taskUDP,
-    "UDP",
-    TASK_UDP_STACK,
-    nullptr,
-    TASK_UDP_PRIORITY,
-    &hTaskUDP,       // ← save handle para xTaskNotifyGive desde Core 1
-    TASK_UDP_CORE
-  );
+      taskUDP, "UDP", TASK_UDP_STACK, nullptr, TASK_UDP_PRIORITY,
+      &hTaskUDP, // ← save handle para xTaskNotifyGive desde Core 1
+      TASK_UDP_CORE);
 
   // --- Resumen del sistema ---
   const size_t pkt_bytes = sizeof(PacketHeader) + BATCH_SIZE * sizeof(float);
@@ -106,18 +101,16 @@ void setup() {
                 RING_SIZE, (unsigned)sizeof(RingSample),
                 RING_SIZE * (unsigned)sizeof(RingSample));
   Serial.printf("    Paquete   : %u bytes (header=%u + payload=%u)\n",
-                (unsigned)pkt_bytes,
-                (unsigned)sizeof(PacketHeader),
+                (unsigned)pkt_bytes, (unsigned)sizeof(PacketHeader),
                 (unsigned)(BATCH_SIZE * sizeof(float)));
-  Serial.printf("    Batch     : %u muestras -> %u pkt/s\n",
-                BATCH_SIZE, (unsigned)(FS_HZ / BATCH_SIZE));
-  Serial.printf("    Destino   : %s:%d (unicast)\n", udp_target_ip.toString().c_str(), UDP_PORT);
+  Serial.printf("    Batch     : %u muestras -> %u pkt/s\n", BATCH_SIZE,
+                (unsigned)(FS_HZ / BATCH_SIZE));
+  Serial.printf("    Destino   : %s:%d (unicast)\n",
+                udp_target_ip.toString().c_str(), UDP_PORT);
   Serial.println("    WiFi PS   : NONE (radio siempre activa)");
   Serial.println("    Core 1    : taskAcquisicion — ADC+DSP @ 1kHz");
   Serial.println("    Core 0    : taskUDP — binario + task notifications");
 }
 
 // Toda la logica vive en las tasks — loop() no se usa
-void loop() {
-  vTaskDelete(nullptr);
-}
+void loop() { vTaskDelete(nullptr); }
