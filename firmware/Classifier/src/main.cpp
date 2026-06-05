@@ -2,7 +2,7 @@
  * ============================================================
  *  main.cpp — Classifier Firmware | XIAO Seeed ESP32-S3
  * ============================================================
- *  Modo: ADC + DSP + buffer circular PSRAM + Inferencia TFLite
+ *  Modo: ADC + DSP + buffer circular PSRAM + Inferencia SVM (micromlgen)
  *
  *  Compilar y flashear:
  *    pio run -e classifier -t upload
@@ -54,14 +54,14 @@ void setup() {
     TASK_ACQ_CORE
   );
 
-  // --- Core 0: Inferencia TFLite ---
+  // --- Core 0: Inferencia SVM ---
   xTaskCreatePinnedToCore(
     taskInferencia,
     "INF",
     TASK_INF_STACK,
     nullptr,
     TASK_INF_PRIORITY,
-    nullptr,
+    &hTaskInferencia, // ← save handle para xTaskNotifyGive desde Core 1
     TASK_INF_CORE
   );
 
@@ -70,8 +70,8 @@ void setup() {
   Serial.printf("    Fs      : %d Hz  (periodo %d us)\n", FS_HZ, SAMPLE_US);
   Serial.printf("    Ventana : %d muestras = %d ms\n", WINDOW_SIZE, WINDOW_SIZE);
   Serial.printf("    Stride  : %d muestras = %d ms\n", WINDOW_STRIDE, WINDOW_STRIDE);
-  Serial.println("    Core 1  : taskAcquisicion — ADC+DSP @ 1kHz → PSRAM");
-  Serial.println("    Core 0  : taskInferencia  — TFLite [pendiente modelo]");
+  Serial.println("    Core 1  : taskAcquisicion — ADC+DSP @ 1kHz → Ring Buffer");
+  Serial.println("    Core 0  : taskInferencia  — SVM (micromlgen)");
 }
 
 // Toda la logica vive en las tasks — loop() no se usa

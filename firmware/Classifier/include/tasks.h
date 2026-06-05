@@ -15,13 +15,24 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
-// Estado compartido entre cores
-extern float*            circBuffer;
+// ============================================================
+// Elemento del ring buffer interno
+// ============================================================
+struct RingSample {
+  uint32_t timestamp_us;   // 4 bytes — micros() en el momento de la muestra
+  float    filtered;       // 4 bytes — señal post-DSP (Notch + HPF + LPF)
+};                         // = 8 bytes por slot
+
+// Estado compartido entre cores (SPSC lock-free)
+extern RingSample        ring[];
+extern volatile uint32_t ring_head;
+extern volatile uint32_t ring_tail;
+extern volatile uint32_t g_dropped;
 extern float*            inferBuf;
-extern volatile int      writeIdx;
-extern volatile int      strideCount;
-extern SemaphoreHandle_t xWindowReady;
-extern SemaphoreHandle_t xBufMutex;
+
+// Handle de taskInferencia — usado por Core 1 para notificar via xTaskNotifyGive
+extern TaskHandle_t hTaskInferencia;
+
 
 // Inicializa PSRAM y primitivas FreeRTOS
 // Llamar desde setup() antes de xTaskCreatePinnedToCore()
