@@ -4,9 +4,7 @@
  * ============================================================
  *
  *  Core 1 — taskAcquisicion : ADC + DSP a 1kHz → buffer circular PSRAM
- *  Core 0 — taskInferencia  : TFLite sobre ventana deslizante (pendiente)
- *
- *  Para streaming UDP de dataset, ver: firmware/Streamer
+ *  Core 0 — taskInferencia  : Extracción de Características + Inferencia
  * ============================================================
  */
 
@@ -21,6 +19,8 @@
 
 #if defined(MODEL_TYPE_SVM)
 #include "svm_model.h"
+#elif defined(MODEL_TYPE_RF)
+#include "rf_model.h"
 #elif defined(MODEL_TYPE_CNN)
 #include "NN_model.h"
 #include "cnn_scaler_params.h"
@@ -105,48 +105,51 @@ bool tasksInit() {
 // ============================================================
 // CORE 1 — taskAcquisicion
 // ============================================================
-// Pipeline: ADC → centrar → Notch → HPF → LPF → ring buffer
-//
-// Politica ante ring lleno: DROP (descartar muestra nueva).
-//
-// Cada vez que el nivel del ring cruza WINDOW_SIZE, notifica
-// a taskInferencia en el Core 0 via xTaskNotifyGive.
-// ============================================================
 void taskAcquisicion(void *pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xPeriod = pdMS_TO_TICKS(1000 / FS_HZ);
 
   Serial.println("[ACQ] Core 1 — adquisicion @ 1kHz");
+  dsp_init(); // Inicializar estados de los filtros IIR
+
+  float raw_block[WINDOW_STRIDE];
+  float filtered_block[WINDOW_STRIDE];
+  int block_idx = 0;
 
   for (;;) {
-    // 1. Leer ADC y aplicar pipeline DSP
+    // 1. Leer ADC y quitar DC Offset
     int raw = readADC(EMG_CHANNEL);
-    float centered = (float)raw - DC_OFFSET;
-    float filtered = lpf(hpf(notch(centered)));
+    raw_block[block_idx++] = (float)raw - DC_OFFSET;
 
-    // Enviar telemetría en formato Teleplot (o Serial Plotter)
-    // Serial.printf(">raw:%d\n>filt:%.3f\n", raw, filtered);
+    // 2. Al llenar el bloque, aplicar DSP vectorial (SIMD)
+    if (block_idx == WINDOW_STRIDE) {
+      dsp_process_block(raw_block, filtered_block, WINDOW_STRIDE);
 
-    // 2. Escribir en ring si hay espacio (politica DROP si lleno)
-    uint32_t h = ring_head;
-    if ((h - ring_tail) < RING_SIZE) {
-      ring[h & RING_MASK].timestamp_us = (uint32_t)micros();
-      ring[h & RING_MASK].filtered = filtered;
+      uint32_t h = ring_head;
+      for (int i = 0; i < WINDOW_STRIDE; i++) {
+        if ((h - ring_tail) < RING_SIZE) {
+          ring[h & RING_MASK].timestamp_us = (uint32_t)micros();
+          ring[h & RING_MASK].filtered = filtered_block[i];
+          h++;
+        } else {
+          g_dropped++;
+        }
+      }
 
-      // Barrera: asegurar que datos esten escritos antes de avanzar head
+      // Barrera de memoria (asegura escritura antes de actualizar head)
       __asm__ volatile("" ::: "memory");
-      ring_head = h + 1;
+      ring_head = h;
 
-      // 3. Cuando hay suficientes muestras para una ventana → despertar
-      // taskInferencia en Core 0
-      if (((h + 1) - ring_tail) >= WINDOW_SIZE) {
+      // 3. Notificar a Core 0 si hay una ventana de 300 muestras lista
+      if ((ring_head - ring_tail) >= WINDOW_SIZE) {
         xTaskNotifyGive(hTaskInferencia);
       }
-    } else {
-      g_dropped++;
+
+      // Reiniciar índice del bloque
+      block_idx = 0;
     }
 
-    // 4. Esperar hasta el proximo tick — sin drift acumulado
+    // 4. Esperar al siguiente tick de 1 ms
     vTaskDelayUntil(&xLastWakeTime, xPeriod);
   }
 }
@@ -154,13 +157,11 @@ void taskAcquisicion(void *pvParameters) {
 // ============================================================
 // CORE 0 — taskInferencia
 // ============================================================
-// Duerme en ulTaskNotifyTake() hasta que Core 1 le avisa que
-// hay al menos WINDOW_SIZE muestras en el ring.
-//
-// En cada ciclo copia WINDOW_SIZE muestras del ring buffer y
-// desliza la cola (ring_tail) en WINDOW_STRIDE muestras.
-// ============================================================
 void taskInferencia(void *pvParameters) {
+  
+  // ==========================================
+  // CONFIGURACIÓN INICIAL (Fuera del Bucle)
+  // ==========================================
 #if defined(MODEL_TYPE_SVM)
   Eloquent::ML::Port::SVM svm;
   float raw_features[6];
@@ -168,154 +169,108 @@ void taskInferencia(void *pvParameters) {
   Serial.println("[INF-SVM] Core 0 — Task inferencia SVM iniciada");
 
 #elif defined(MODEL_TYPE_RF)
-  Serial.println("[INF-RF] Core 0 — Task inferencia RF iniciada (Stub)");
+  Eloquent::ML::Port::RandomForest rf;
+  float raw_features[6];
+  Serial.println("[INF-RF] Core 0 — Task inferencia RF iniciada");
 
 #elif defined(MODEL_TYPE_CNN)
-  Serial.println(
-      "[INF-CNN] Task inferencia CNN (TFLite Micro) iniciada");
+  Serial.println("[INF-CNN] Task inferencia CNN (TFLite Micro) iniciada");
   Serial.flush();
   vTaskDelay(pdMS_TO_TICKS(100));
 
-  // 1. Instanciar variables de TFLite
   const tflite::Model *model = tflite::GetModel(g_model_data);
   if (model->version() != TFLITE_SCHEMA_VERSION) {
-    Serial.printf("[ERROR] Model schema version %d is not equal to supported "
-                  "version %d.\n",
-                  model->version(), TFLITE_SCHEMA_VERSION);
-    Serial.flush();
-    vTaskDelay(pdMS_TO_TICKS(100));
+    Serial.printf("[ERROR] Model schema version mismatch.\n");
     vTaskDelete(NULL);
   }
 
-  // 2. Resolver operaciones (AllOpsResolver registra todos los ops disponibles)
   static tflite::AllOpsResolver resolver;
-
-  // 3. Definir y alinear Tensor Arena en PSRAM (500 KB) para liberar SRAM interna
   constexpr int kTensorArenaSize = 500 * 1024;
   static uint8_t *tensor_arena = nullptr;
   if (!tensor_arena) {
     tensor_arena = (uint8_t *)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_SPIRAM);
     if (!tensor_arena) {
-      Serial.println("[ERROR] Fallo al alojar tensor_arena de 500KB en PSRAM!");
-      Serial.flush();
-      vTaskDelay(pdMS_TO_TICKS(100));
+      Serial.println("[ERROR] Fallo al alojar tensor_arena!");
       vTaskDelete(NULL);
     }
   }
 
-  // 4. Inicializar Intérprete
-  static tflite::MicroInterpreter interpreter(model, resolver, tensor_arena,
-                                              kTensorArenaSize);
-
-  // Alojar tensores
+  static tflite::MicroInterpreter interpreter(model, resolver, tensor_arena, kTensorArenaSize);
   TfLiteStatus allocate_status = interpreter.AllocateTensors();
   if (allocate_status != kTfLiteOk) {
     Serial.println("[ERROR] AllocateTensors() falló!");
-    Serial.flush();
-    vTaskDelay(pdMS_TO_TICKS(100));
     vTaskDelete(NULL);
   }
 
-  // Obtener tensores de entrada y salida
   TfLiteTensor *input = interpreter.input(0);
   TfLiteTensor *output = interpreter.output(0);
-
-  // Validar dimensiones de la entrada (debe ser 1 x 300 x 1)
-  if (input->dims->size != 3 || input->dims->data[0] != 1 ||
-      input->dims->data[1] != WINDOW_SIZE || input->dims->data[2] != 1) {
-    Serial.println(
-        "[ERROR] El tensor de entrada no tiene la forma esperada (1, 300, 1)!");
-    Serial.flush();
-    vTaskDelay(pdMS_TO_TICKS(100));
-    vTaskDelete(NULL);
-  }
-
   float input_scale = input->params.scale;
   int32_t input_zero_point = input->params.zero_point;
-  Serial.printf("[INF-CNN] TFLite inicializado. Arena utilizada: %d bytes. "
-                "Scale: %.6f, ZeroPoint: %d\n",
-                interpreter.arena_used_bytes(), input_scale, input_zero_point);
-  Serial.flush();
-  vTaskDelay(pdMS_TO_TICKS(100));
+  Serial.printf("[INF-CNN] TFLite inicializado. Scale: %.6f, ZeroPoint: %d\n", input_scale, input_zero_point);
 #else
-  Serial.println("[INF] Core 0 — Ningún modelo especificado (Flag faltante)");
+  Serial.println("[INF] Core 0 — Ningún modelo especificado");
 #endif
 
-  // Inicializar UDP si WiFi está conectado
   if (WiFi.status() == WL_CONNECTED) {
     udp.begin(UDP_PORT);
     Serial.printf("[WiFi] Servidor UDP iniciado en puerto %d\n", UDP_PORT);
-    Serial.flush();
   }
 
   for (;;) {
-    // --- Dormir hasta que la adquisicion notifique ---
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    // --- Procesar todas las ventanas disponibles ---
     while ((ring_head - ring_tail) >= WINDOW_SIZE) {
       uint32_t t = ring_tail;
 
-      // Copiar de ring buffer a inferBuf (ventana de WINDOW_SIZE muestras)
-      // Normalizamos cada muestra con el voltaje MVC_VOLTAGE_V para alinear con
-      // el dataset de entrenamiento
+      // ==========================================
+      // MÓDULO 1: Window Manager
+      // ==========================================
       for (int i = 0; i < WINDOW_SIZE; i++) {
         inferBuf[i] = ring[(t + i) & RING_MASK].filtered / MVC_VOLTAGE_V;
       }
-
-      // Avanzar tail por WINDOW_STRIDE (avanza la ventana deslizante)
       __asm__ volatile("" ::: "memory");
       ring_tail = t + WINDOW_STRIDE;
 
       int raw_prediction = 0;
 
-#if defined(MODEL_TYPE_SVM)
-      // 1. Extracción de Características (MAV, RMS, WL, ZC, SSC, VAR)
+      // ==========================================
+      // MÓDULO 2: Feature Extractor
+      // (Se omite para CNN para ahorrar CPU)
+      // ==========================================
+#if defined(MODEL_TYPE_SVM) || defined(MODEL_TYPE_RF)
       raw_features[0] = compute_mav(inferBuf, WINDOW_SIZE);
       raw_features[1] = compute_rms(inferBuf, WINDOW_SIZE);
       raw_features[2] = compute_wl(inferBuf, WINDOW_SIZE);
       raw_features[3] = compute_zc(inferBuf, WINDOW_SIZE, NOISE_THRESHOLD);
       raw_features[4] = compute_ssc(inferBuf, WINDOW_SIZE, NOISE_THRESHOLD);
       raw_features[5] = compute_var(inferBuf, WINDOW_SIZE);
+#endif
 
-      // 2. Estandarización Z-Score
+      // ==========================================
+      // MÓDULO 3: Motor de Inferencia
+      // ==========================================
+#if defined(MODEL_TYPE_SVM)
       scale_features(raw_features, scaled_features);
-
-      // DEBUG: Imprimir features crudas y escaladas
-      Serial.printf("[DBG] Raw:    MAV=%.4f RMS=%.4f WL=%.2f ZC=%.0f SSC=%.0f VAR=%.6f\n",
-                    raw_features[0], raw_features[1], raw_features[2],
-                    raw_features[3], raw_features[4], raw_features[5]);
-      Serial.printf("[DBG] Scaled: MAV=%.2f RMS=%.2f WL=%.2f ZC=%.2f SSC=%.2f VAR=%.2f\n",
-                    scaled_features[0], scaled_features[1], scaled_features[2],
-                    scaled_features[3], scaled_features[4], scaled_features[5]);
-
-      // 3. Inferencia SVM
       raw_prediction = svm.predict(scaled_features);
 
 #elif defined(MODEL_TYPE_RF)
-      // Inferencia Random Forest (Placeholder - retorna clase 0 / reposo)
-      raw_prediction = 0;
+      // RF no requiere escalado de características
+      raw_prediction = rf.predict(raw_features);
 
 #elif defined(MODEL_TYPE_CNN)
-      // 1. Estandarización Z-Score y Cuantización de Entrada (Float32 -> Int8)
-      // input_val_int8 = round(standardized_val / scale) + zero_point
       int8_t *input_data = input->data.int8;
       for (int i = 0; i < WINDOW_SIZE; i++) {
         float raw_val = inferBuf[i];
-        // Aplicar StandardScaler
         float val = (raw_val - signal_mean) / signal_std;
         int32_t quantized = std::round(val / input_scale) + input_zero_point;
         input_data[i] = (int8_t)std::max(-128, std::min(127, (int)quantized));
       }
 
-      // 2. Invocación de Inferencia
-      TfLiteStatus invoke_status = interpreter.Invoke();
-      if (invoke_status != kTfLiteOk) {
+      if (interpreter.Invoke() != kTfLiteOk) {
         Serial.println("[ERROR] Invoke falló!");
         continue;
       }
 
-      // 3. ArgMax en el Output (Detección de clase en INT8)
       int8_t *output_data = output->data.int8;
       int max_idx = 0;
       int8_t max_val = output_data[0];
@@ -328,10 +283,14 @@ void taskInferencia(void *pvParameters) {
       raw_prediction = max_idx;
 #endif
 
-      // 4. Suavizado por Votación Mayoritaria
+      // ==========================================
+      // MÓDULO 4: Post-procesamiento
+      // ==========================================
       int filtered_prediction = majority_vote(raw_prediction);
 
-      // Enviar predicción por UDP si WiFi está conectado (Paquete Binario Compacto - 10 bytes)
+      // ==========================================
+      // MÓDULO 5: Control Actuador y UDP
+      // ==========================================
       if (WiFi.status() == WL_CONNECTED) {
         struct __attribute__((packed)) {
           uint8_t filtered_prediction;
@@ -350,12 +309,14 @@ void taskInferencia(void *pvParameters) {
         udp.endPacket();
       }
 
-      // 5. Impresión en Monitor Serie
-      const char *gesture_names[] = {"REPOSO", "PALMA", "PUNO", "PAZ"};
+      // [PENDIENTE] Control I2C Servomotores 
+      // if (filtered_prediction == 1) { setServoAngle(180); } ...
 
+      // Impresión en Monitor Serie
+      const char *gesture_names[] = {"REPOSO", "PALMA", "PUNO", "PAZ"};
 #if defined(MODEL_TYPE_CNN)
       Serial.printf("[INF-CNN] Crudo: %-6s (%d) | Suavizado: %-6s (%d) | Out "
-                    "Prob (INT8): [%d, %d, %d, %d]\n",
+                    "Prob: [%d, %d, %d, %d]\n",
                     gesture_names[raw_prediction], raw_prediction,
                     gesture_names[filtered_prediction], filtered_prediction,
                     output->data.int8[0], output->data.int8[1],
@@ -368,7 +329,8 @@ void taskInferencia(void *pvParameters) {
                     compute_mav(inferBuf, WINDOW_SIZE),
                     compute_rms(inferBuf, WINDOW_SIZE));
 #endif
-      // Ceder CPU de manera efectiva al IDLE task para evitar trigger del Task Watchdog (WDT)
+      
+      // Ceder CPU
       vTaskDelay(pdMS_TO_TICKS(1));
     }
   }

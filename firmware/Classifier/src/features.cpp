@@ -1,10 +1,17 @@
 #include "features.h"
 #include "scaler_params.h"
+#include "esp_dsp.h"
 #include <cmath>
 
 float compute_mav(const float *x, int w) {
   float sum = 0.0f;
-  for (int i = 0; i < w; i++) {
+  int i = 0;
+  // Loop Unrolling 4x para maximizar IPC (Instructions Per Cycle)
+  for (; i <= w - 4; i += 4) {
+    sum += fabsf(x[i]) + fabsf(x[i+1]) + fabsf(x[i+2]) + fabsf(x[i+3]);
+  }
+  // Procesar las muestras restantes si 'w' no es múltiplo de 4
+  for (; i < w; i++) {
     sum += fabsf(x[i]);
   }
   return sum / w;
@@ -12,15 +19,22 @@ float compute_mav(const float *x, int w) {
 
 float compute_rms(const float *x, int w) {
   float sum_sq = 0.0f;
-  for (int i = 0; i < w; i++) {
-    sum_sq += x[i] * x[i];
-  }
+  // Producto punto del vector consigo mismo usando SIMD (128-bit MAC)
+  dsps_dotprod_f32(x, x, &sum_sq, w);
   return sqrtf(sum_sq / w);
 }
 
 float compute_wl(const float *x, int w) {
   float wl = 0.0f;
-  for (int i = 0; i < w - 1; i++) {
+  int i = 0;
+  // Loop Unrolling 4x
+  for (; i <= w - 1 - 4; i += 4) {
+    wl += fabsf(x[i + 1] - x[i]) + 
+          fabsf(x[i + 2] - x[i + 1]) + 
+          fabsf(x[i + 3] - x[i + 2]) + 
+          fabsf(x[i + 4] - x[i + 3]);
+  }
+  for (; i < w - 1; i++) {
     wl += fabsf(x[i + 1] - x[i]);
   }
   return wl;
@@ -28,42 +42,61 @@ float compute_wl(const float *x, int w) {
 
 float compute_zc(const float *x, int w, float threshold) {
   int count = 0;
-  for (int i = 0; i < w - 1; i++) {
-    bool sign_change = (x[i] * x[i + 1] < 0.0f);
-    bool diff_above = (fabsf(x[i] - x[i + 1]) > threshold);
-    if (sign_change && diff_above) {
-      count++;
-    }
+  int i = 0;
+  // Loop Unrolling 4x
+  for (; i <= w - 1 - 4; i += 4) {
+    if ((x[i] * x[i + 1] < 0.0f) && (fabsf(x[i] - x[i + 1]) > threshold)) count++;
+    if ((x[i+1] * x[i + 2] < 0.0f) && (fabsf(x[i+1] - x[i + 2]) > threshold)) count++;
+    if ((x[i+2] * x[i + 3] < 0.0f) && (fabsf(x[i+2] - x[i + 3]) > threshold)) count++;
+    if ((x[i+3] * x[i + 4] < 0.0f) && (fabsf(x[i+3] - x[i + 4]) > threshold)) count++;
+  }
+  for (; i < w - 1; i++) {
+    if ((x[i] * x[i + 1] < 0.0f) && (fabsf(x[i] - x[i + 1]) > threshold)) count++;
   }
   return (float)count;
 }
 
 float compute_ssc(const float *x, int w, float threshold) {
   int count = 0;
-  for (int i = 1; i < w - 1; i++) {
+  int i = 1;
+  // Loop Unrolling 4x
+  for (; i <= w - 1 - 4; i += 4) {
+    float d1 = x[i] - x[i - 1]; float d2 = x[i + 1] - x[i];
+    if ((d1 * d2 < 0.0f) && (fabsf(d1) > threshold) && (fabsf(d2) > threshold)) count++;
+    
+    d1 = x[i+1] - x[i]; d2 = x[i + 2] - x[i+1];
+    if ((d1 * d2 < 0.0f) && (fabsf(d1) > threshold) && (fabsf(d2) > threshold)) count++;
+    
+    d1 = x[i+2] - x[i+1]; d2 = x[i + 3] - x[i+2];
+    if ((d1 * d2 < 0.0f) && (fabsf(d1) > threshold) && (fabsf(d2) > threshold)) count++;
+    
+    d1 = x[i+3] - x[i+2]; d2 = x[i + 4] - x[i+3];
+    if ((d1 * d2 < 0.0f) && (fabsf(d1) > threshold) && (fabsf(d2) > threshold)) count++;
+  }
+  for (; i < w - 1; i++) {
     float d1 = x[i] - x[i - 1];
     float d2 = x[i + 1] - x[i];
-    bool slope_change = (d1 * d2 < 0.0f);
-    bool diff_above = (fabsf(d1) > threshold) && (fabsf(d2) > threshold);
-    if (slope_change && diff_above) {
-      count++;
-    }
+    if ((d1 * d2 < 0.0f) && (fabsf(d1) > threshold) && (fabsf(d2) > threshold)) count++;
   }
   return (float)count;
 }
 
 float compute_var(const float *x, int w) {
   float sum = 0.0f;
-  for (int i = 0; i < w; i++) {
-    sum += x[i];
+  int i = 0;
+  for (; i <= w - 4; i += 4) {
+    sum += x[i] + x[i+1] + x[i+2] + x[i+3];
   }
+  for (; i < w; i++) sum += x[i];
   float mean = sum / w;
-  float sum_diff_sq = 0.0f;
-  for (int i = 0; i < w; i++) {
-    float diff = x[i] - mean;
-    sum_diff_sq += diff * diff;
-  }
-  return sum_diff_sq / (w - 1);
+  
+  float sum_sq = 0.0f;
+  // Producto punto vectorial usando SIMD
+  dsps_dotprod_f32(x, x, &sum_sq, w);
+  
+  // Fórmula optimizada O(1) de Varianza Muestral sin iterar nuevamente: 
+  // Var = (Sum(X^2) - N * Mean^2) / (N - 1)
+  return (sum_sq - w * mean * mean) / (w - 1);
 }
 
 void scale_features(const float *raw_feats, float *scaled_feats) {
