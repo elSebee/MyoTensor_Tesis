@@ -17,15 +17,32 @@
  */
 
 #include <Arduino.h>
+#include <WiFi.h>
 #include "config.h"
 #include "adc.h"
 #include "tasks.h"
+#include "secrets.h"
 // #include "pca9685.h"  // [pendiente — control de servos]
 
 void setup() {
   Serial.begin(921600);
   delay(500);
   Serial.println("\n=== Classifier — MyoTensor S3 ===");
+
+  // --- Conectar a WiFi ---
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("[WiFi] Conectando a %s", WIFI_SSID);
+  unsigned long start_ms = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start_ms < WIFI_TIMEOUT_MS)) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[OK] WiFi conectado! IP: %s\n", WiFi.localIP().toString().c_str());
+    WiFi.setSleep(false); // Desactivar sleep para menor latencia UDP
+  } else {
+    Serial.println("\n[WARNING] No se pudo conectar a WiFi. Operando en modo Offline.");
+  }
 
   // --- Hardware ---
   adcInit();

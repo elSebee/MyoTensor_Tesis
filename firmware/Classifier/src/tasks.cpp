@@ -16,11 +16,15 @@
 #include "dsp.h"
 #include "features.h"
 #include <cmath>
+#include <WiFi.h>
+#include <WiFiUdp.h>
 
 #if defined(MODEL_TYPE_SVM)
 #include "svm_model.h"
 #elif defined(MODEL_TYPE_CNN)
 #include "NN_model.h"
+#include "cnn_scaler_params.h"
+#include "esp_heap_caps.h"
 #include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
@@ -35,6 +39,7 @@ volatile uint32_t ring_tail = 0;
 volatile uint32_t g_dropped = 0;
 float *inferBuf = nullptr;
 TaskHandle_t hTaskInferencia = nullptr;
+WiFiUDP udp;
 
 // ── Filtro de Votación Mayoritaria (Majority Vote) con BUFFER_SIZE = 5 ──
 int majority_vote(int new_prediction) {
@@ -167,7 +172,9 @@ void taskInferencia(void *pvParameters) {
 
 #elif defined(MODEL_TYPE_CNN)
   Serial.println(
-      "[INF-CNN] Core 0 — Task inferencia CNN (TFLite Micro) iniciada");
+      "[INF-CNN] Task inferencia CNN (TFLite Micro) iniciada");
+  Serial.flush();
+  vTaskDelay(pdMS_TO_TICKS(100));
 
   // 1. Instanciar variables de TFLite
   const tflite::Model *model = tflite::GetModel(g_model_data);
@@ -175,15 +182,26 @@ void taskInferencia(void *pvParameters) {
     Serial.printf("[ERROR] Model schema version %d is not equal to supported "
                   "version %d.\n",
                   model->version(), TFLITE_SCHEMA_VERSION);
+    Serial.flush();
+    vTaskDelay(pdMS_TO_TICKS(100));
     vTaskDelete(NULL);
   }
 
   // 2. Resolver operaciones (AllOpsResolver registra todos los ops disponibles)
   static tflite::AllOpsResolver resolver;
 
-  // 3. Definir y alinear Tensor Arena en SRAM
-  constexpr int kTensorArenaSize = 160 * 1024;
-  alignas(16) static uint8_t tensor_arena[kTensorArenaSize];
+  // 3. Definir y alinear Tensor Arena en PSRAM (500 KB) para liberar SRAM interna
+  constexpr int kTensorArenaSize = 500 * 1024;
+  static uint8_t *tensor_arena = nullptr;
+  if (!tensor_arena) {
+    tensor_arena = (uint8_t *)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_SPIRAM);
+    if (!tensor_arena) {
+      Serial.println("[ERROR] Fallo al alojar tensor_arena de 500KB en PSRAM!");
+      Serial.flush();
+      vTaskDelay(pdMS_TO_TICKS(100));
+      vTaskDelete(NULL);
+    }
+  }
 
   // 4. Inicializar Intérprete
   static tflite::MicroInterpreter interpreter(model, resolver, tensor_arena,
@@ -193,6 +211,8 @@ void taskInferencia(void *pvParameters) {
   TfLiteStatus allocate_status = interpreter.AllocateTensors();
   if (allocate_status != kTfLiteOk) {
     Serial.println("[ERROR] AllocateTensors() falló!");
+    Serial.flush();
+    vTaskDelay(pdMS_TO_TICKS(100));
     vTaskDelete(NULL);
   }
 
@@ -205,6 +225,8 @@ void taskInferencia(void *pvParameters) {
       input->dims->data[1] != WINDOW_SIZE || input->dims->data[2] != 1) {
     Serial.println(
         "[ERROR] El tensor de entrada no tiene la forma esperada (1, 300, 1)!");
+    Serial.flush();
+    vTaskDelay(pdMS_TO_TICKS(100));
     vTaskDelete(NULL);
   }
 
@@ -213,9 +235,18 @@ void taskInferencia(void *pvParameters) {
   Serial.printf("[INF-CNN] TFLite inicializado. Arena utilizada: %d bytes. "
                 "Scale: %.6f, ZeroPoint: %d\n",
                 interpreter.arena_used_bytes(), input_scale, input_zero_point);
+  Serial.flush();
+  vTaskDelay(pdMS_TO_TICKS(100));
 #else
   Serial.println("[INF] Core 0 — Ningún modelo especificado (Flag faltante)");
 #endif
+
+  // Inicializar UDP si WiFi está conectado
+  if (WiFi.status() == WL_CONNECTED) {
+    udp.begin(UDP_PORT);
+    Serial.printf("[WiFi] Servidor UDP iniciado en puerto %d\n", UDP_PORT);
+    Serial.flush();
+  }
 
   for (;;) {
     // --- Dormir hasta que la adquisicion notifique ---
@@ -266,11 +297,13 @@ void taskInferencia(void *pvParameters) {
       raw_prediction = 0;
 
 #elif defined(MODEL_TYPE_CNN)
-      // 1. Cuantización de Entrada (Float32 -> Int8)
-      // input_val_int8 = round(float_val / scale) + zero_point
+      // 1. Estandarización Z-Score y Cuantización de Entrada (Float32 -> Int8)
+      // input_val_int8 = round(standardized_val / scale) + zero_point
       int8_t *input_data = input->data.int8;
       for (int i = 0; i < WINDOW_SIZE; i++) {
-        float val = inferBuf[i];
+        float raw_val = inferBuf[i];
+        // Aplicar StandardScaler
+        float val = (raw_val - signal_mean) / signal_std;
         int32_t quantized = std::round(val / input_scale) + input_zero_point;
         input_data[i] = (int8_t)std::max(-128, std::min(127, (int)quantized));
       }
@@ -298,6 +331,25 @@ void taskInferencia(void *pvParameters) {
       // 4. Suavizado por Votación Mayoritaria
       int filtered_prediction = majority_vote(raw_prediction);
 
+      // Enviar predicción por UDP si WiFi está conectado (Paquete Binario Compacto - 10 bytes)
+      if (WiFi.status() == WL_CONNECTED) {
+        struct __attribute__((packed)) {
+          uint8_t filtered_prediction;
+          uint8_t raw_prediction;
+          float mav;
+          float rms;
+        } packet;
+
+        packet.filtered_prediction = (uint8_t)filtered_prediction;
+        packet.raw_prediction = (uint8_t)raw_prediction;
+        packet.mav = compute_mav(inferBuf, WINDOW_SIZE);
+        packet.rms = compute_rms(inferBuf, WINDOW_SIZE);
+
+        udp.beginPacket(UDP_BROADCAST_IP, UDP_PORT);
+        udp.write((const uint8_t*)&packet, sizeof(packet));
+        udp.endPacket();
+      }
+
       // 5. Impresión en Monitor Serie
       const char *gesture_names[] = {"REPOSO", "PALMA", "PUNO", "PAZ"};
 
@@ -316,8 +368,8 @@ void taskInferencia(void *pvParameters) {
                     compute_mav(inferBuf, WINDOW_SIZE),
                     compute_rms(inferBuf, WINDOW_SIZE));
 #endif
-      // Ceder CPU al IDLE task para evitar trigger del Task Watchdog (WDT)
-      taskYIELD();
+      // Ceder CPU de manera efectiva al IDLE task para evitar trigger del Task Watchdog (WDT)
+      vTaskDelay(pdMS_TO_TICKS(1));
     }
   }
 }
