@@ -206,6 +206,16 @@ void taskInferencia(void *pvParameters) {
   TfLiteTensor *output = interpreter.output(0);
   float input_scale = input->params.scale;
   int32_t input_zero_point = input->params.zero_point;
+  
+  // ======================================================================
+  // [OPTIMIZACIÓN DE HW]: Pre-calcular factores de escala para evitar 
+  // divisiones lentas por cada muestra en el ciclo de inferencia.
+  // formula original: val = (raw - mean) / std; q = val / scale + z_point
+  // formula rápida: q = raw * (1 / (std*scale)) + (z_point - mean / (std*scale))
+  // ======================================================================
+  const float cnn_inv_scale = 1.0f / (signal_std * input_scale);
+  const float cnn_offset = -(signal_mean * cnn_inv_scale) + input_zero_point;
+  
   Serial.printf("[INF-CNN] TFLite inicializado. Scale: %.6f, ZeroPoint: %d\n", input_scale, input_zero_point);
 #else
   Serial.println("[INF] Core 0 — Ningún modelo especificado");
@@ -260,10 +270,18 @@ void taskInferencia(void *pvParameters) {
 #elif defined(MODEL_TYPE_CNN)
       int8_t *input_data = input->data.int8;
       for (int i = 0; i < WINDOW_SIZE; i++) {
+        // [OPTIMIZACIÓN]: Fusión de escalado Z-Score + Cuantización INT8.
+        // Utiliza una sola instrucción fma (fused multiply-add) del ESP32-S3 y
+        // casteo rápido truncando en lugar de usar librerías <cmath> pesadas.
         float raw_val = inferBuf[i];
-        float val = (raw_val - signal_mean) / signal_std;
-        int32_t quantized = std::round(val / input_scale) + input_zero_point;
-        input_data[i] = (int8_t)std::max(-128, std::min(127, (int)quantized));
+        float scaled_val = raw_val * cnn_inv_scale + cnn_offset;
+        int32_t q = (int32_t)(scaled_val + (scaled_val >= 0 ? 0.5f : -0.5f));
+        
+        // Saturación rápida por ifs (más rápido que std::min/max)
+        if (q < -128) q = -128;
+        else if (q > 127) q = 127;
+        
+        input_data[i] = (int8_t)q;
       }
 
       if (interpreter.Invoke() != kTfLiteOk) {
