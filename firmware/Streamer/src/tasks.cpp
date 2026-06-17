@@ -57,6 +57,9 @@ bool tasksInit() {
                 (unsigned)pkt_size,
                 (unsigned)sizeof(PacketHeader),
                 (unsigned)(BATCH_SIZE * sizeof(float)));
+                
+  dsp_init();
+  Serial.println("[OK] Filtros DSP SIMD (esp_dsp) inicializados");
   return true;
 }
 
@@ -142,36 +145,51 @@ void taskAcquisicion(void* pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xPeriod = pdMS_TO_TICKS(1000 / FS_HZ);
 
-  Serial.println("[ACQ] Core 1 — adquisicion @ 1kHz");
+  Serial.println("[ACQ] Core 1 — adquisicion vectorizada @ 1kHz");
+
+  static float raw_batch[BATCH_SIZE];
+  static uint32_t ts_batch[BATCH_SIZE];
+  static int batch_idx = 0;
 
   for (;;) {
-    // 1. Leer ADC y aplicar pipeline DSP
+    // 1. Leer ADC y guardar en batch crudo
     int   raw      = readADC(EMG_CHANNEL);
     float centered = (float)raw - DC_OFFSET;
-    float filtered = lpf(hpf(notch(centered)));
+    
+    raw_batch[batch_idx] = centered;
+    ts_batch[batch_idx]  = (uint32_t)micros();
+    batch_idx++;
 
-    // 2. Escribir en ring si hay espacio (politica DROP si lleno)
-    uint32_t h = ring_head;
-    if ((h - ring_tail) < RING_SIZE) {
-      ring[h & RING_MASK].timestamp_us = (uint32_t)micros();
-      ring[h & RING_MASK].filtered     = filtered;
+    // 2. Si el batch esta completo, procesar y enviar al ring
+    if (batch_idx == BATCH_SIZE) {
+      float filtered_batch[BATCH_SIZE];
+      
+      // Aplicar pipeline DSP completo sobre el bloque usando SIMD
+      dsp_process_block(raw_batch, filtered_batch, BATCH_SIZE);
 
-      // Barrera: asegurar que datos esten escritos antes de avanzar head
-      __asm__ volatile("" ::: "memory");
-      ring_head = h + 1;
+      uint32_t h = ring_head;
+      
+      // Chequear que haya espacio para el batch completo en el ring
+      if ((h - ring_tail) + BATCH_SIZE <= RING_SIZE) {
+        for (int i = 0; i < BATCH_SIZE; i++) {
+          ring[(h + i) & RING_MASK].timestamp_us = ts_batch[i];
+          ring[(h + i) & RING_MASK].filtered     = filtered_batch[i];
+        }
 
-      // 3. Cuando hay un batch completo → despertar taskUDP en Core 0
-      //    xTaskNotifyGive es ISR-safe y no causa context switch en Core 1
-      if (((h + 1) - ring_tail) >= BATCH_SIZE &&
-          ((h)     - ring_tail) <  BATCH_SIZE) {
-        // Justo cruzamos el umbral — notificar una vez
+        // Barrera de memoria
+        __asm__ volatile("" ::: "memory");
+        ring_head = h + BATCH_SIZE;
+
+        // Despertar taskUDP
         xTaskNotifyGive(hTaskUDP);
+      } else {
+        g_dropped += BATCH_SIZE;
       }
-    } else {
-      g_dropped++;
+      
+      batch_idx = 0;
     }
 
-    // 4. Esperar hasta el proximo tick — sin drift acumulado
+    // 3. Esperar hasta el proximo tick — sin drift acumulado
     vTaskDelayUntil(&xLastWakeTime, xPeriod);
   }
 }
