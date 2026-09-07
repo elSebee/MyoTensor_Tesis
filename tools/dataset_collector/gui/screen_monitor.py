@@ -137,8 +137,9 @@ class MonitorScreen(QWidget):
         self.input_circumference.setSuffix(" cm")
         self.input_circumference.setMaximumWidth(140)
 
-        self.input_muscle = QLineEdit("")
-        self.input_muscle.setMaximumWidth(260)
+        self.input_muscle = QComboBox()
+        self.input_muscle.addItems(["FDS", "ED"])
+        self.input_muscle.setMaximumWidth(140)
 
         grid.addWidget(lbl("Circunferencia antebrazo (cm)"), 2, 0, 1, 2)
         grid.addWidget(self.input_circumference,              3, 0)
@@ -176,7 +177,7 @@ class MonitorScreen(QWidget):
             "gender":                gender_map.get(self.input_gender.currentText(), "m"),
             "laterality":            lat_map.get(self.input_laterality.currentText(), "r"),
             "forearm_circumference_cm": self.input_circumference.value(),
-            "muscle":                self.input_muscle.text().strip(),
+            "muscle":                self.input_muscle.currentText(),
         }
 
     def _on_start_clicked(self):
@@ -185,11 +186,6 @@ class MonitorScreen(QWidget):
         if not info["subject_id"]:
             QMessageBox.warning(self, "Dato faltante",
                                 "Ingresa un ID de sujeto antes de iniciar.")
-            return
-
-        if not info["muscle"]:
-            QMessageBox.warning(self, "Dato faltante",
-                                "Ingresa el nombre del músculo.")
             return
 
         self.start_requested.emit(info)

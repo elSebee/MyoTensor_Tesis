@@ -1,5 +1,6 @@
 from sklearn.svm import SVC
 from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
 import micromlgen
 
 def train(X_train, y_train, C=1000, gamma='scale', kernel='rbf'):
@@ -9,6 +10,31 @@ def train(X_train, y_train, C=1000, gamma='scale', kernel='rbf'):
     model = SVC(C=C, gamma=gamma, kernel=kernel, class_weight='balanced', random_state=42)
     model.fit(X_train, y_train)
     return model
+
+def train_with_gridsearch(X_train, y_train):
+    """
+    Optimiza y entrena un modelo SVM usando GridSearchCV.
+    """
+    param_grid = {
+        'C': [0.1, 1, 10, 100, 1000],
+        'gamma': ['scale', 'auto', 0.001, 0.01, 0.1, 1],
+        'kernel': ['rbf', 'linear', 'sigmoid']
+    }
+    
+    svm_base = SVC(class_weight='balanced', random_state=42)
+    cv_strategy = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    
+    grid_search = GridSearchCV(
+        estimator=svm_base,
+        param_grid=param_grid,
+        cv=cv_strategy,
+        scoring='accuracy',
+        n_jobs=-1,
+        verbose=1
+    )
+    
+    grid_search.fit(X_train, y_train)
+    return grid_search.best_estimator_
 
 def evaluate(model, X_test, y_test):
     """

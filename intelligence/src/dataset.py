@@ -18,15 +18,16 @@ def load_and_segment_dataset(subject, muscle, window_size=300, overlap=150):
     """
     # 1. Definir la ruta base
     try:
-        base_dir = Path(os.environ.get("RAW_DATA_PATH", f"intelligence/datasets/raw/myotensor_proto/{muscle}"))
+        default_path = Path(__file__).parent.parent / "datasets" / "raw" / "myotensor_proto" / muscle
+        base_dir = Path(os.environ.get("RAW_DATA_PATH", default_path))
     except:
-        base_dir = Path(f"intelligence/datasets/raw/myotensor_proto/{muscle}")
+        base_dir = Path(__file__).parent.parent / "datasets" / "raw" / "myotensor_proto" / muscle
         
     # Buscar archivos del sujeto
     subject_dir = base_dir / subject
     csv_files = sorted(list(subject_dir.glob("session_*.csv")))
     if not csv_files:
-        raise FileNotFoundError(f"No se encontraron CSVs para {subject} en {subject_dir}")
+        raise FileNotFoundError(f"No se encontraron CSV's para {subject} en {subject_dir} el path es {default_path}")
         
     df_raw = pd.read_csv(csv_files[0])
     

@@ -92,7 +92,8 @@ class DataWriter:
             return None, None
 
         subject_id = self.subject_info.get("subject_id", "S00")
-        subdir     = os.path.join(self.output_dir, subject_id)
+        muscle     = self.subject_info.get("muscle", "FDS")
+        subdir     = os.path.join(self.output_dir, muscle, subject_id)
         os.makedirs(subdir, exist_ok=True)
 
         ts        = self.session_start.strftime("%Y%m%d_%H%M%S")

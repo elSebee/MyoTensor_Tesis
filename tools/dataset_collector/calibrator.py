@@ -99,13 +99,16 @@ class Calibrator(QObject):
         if mvc_voltage_v < 1e-6:
             mvc_voltage_v = 1.0
 
+        normalized_noise_std = noise_std / mvc_voltage_v
+
         result = {
-            "noise_mean":        noise_mean,
-            "noise_std":         noise_std,
-            "onset_threshold_v": onset_threshold_v,
-            "mvc_voltage_v":     mvc_voltage_v,
-            "noise_samples":     int(len(noise)),
-            "mvc_samples":       int(len(mvc)),
+            "noise_mean":           noise_mean,
+            "noise_std":            noise_std,
+            "onset_threshold_v":    onset_threshold_v,
+            "mvc_voltage_v":        mvc_voltage_v,
+            "normalized_noise_std": normalized_noise_std,
+            "noise_samples":        int(len(noise)),
+            "mvc_samples":          int(len(mvc)),
         }
 
         print(f"[CAL] noise: mean={noise_mean:.4f}V  std={noise_std:.4f}V")

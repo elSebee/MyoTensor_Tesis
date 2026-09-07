@@ -1,5 +1,6 @@
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
 import micromlgen
 
 def train(X_train, y_train, n_estimators=50, max_depth=10, min_samples_split=5):
@@ -16,6 +17,31 @@ def train(X_train, y_train, n_estimators=50, max_depth=10, min_samples_split=5):
     )
     model.fit(X_train, y_train)
     return model
+
+def train_with_gridsearch(X_train, y_train):
+    """
+    Optimiza y entrena un modelo Random Forest usando GridSearchCV.
+    """
+    param_grid = {
+        'n_estimators': [50, 100, 200],
+        'max_depth': [None, 10, 20],
+        'min_samples_split': [2, 5, 10]
+    }
+    
+    rf_base = RandomForestClassifier(class_weight='balanced', random_state=42, n_jobs=-1)
+    cv_strategy = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    
+    grid_search = GridSearchCV(
+        estimator=rf_base,
+        param_grid=param_grid,
+        cv=cv_strategy,
+        scoring='accuracy',
+        n_jobs=-1,
+        verbose=1
+    )
+    
+    grid_search.fit(X_train, y_train)
+    return grid_search.best_estimator_
 
 def evaluate(model, X_test, y_test):
     """

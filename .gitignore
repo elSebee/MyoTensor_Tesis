@@ -86,3 +86,9 @@ docs/references/
 
 # ─── Credenciales WiFi ─────────────────────────────────────
 firmware/**/include/secrets.h
+
+GEMINI.md
+pseudocodigos
+test
+.gemini
+.codegraph
