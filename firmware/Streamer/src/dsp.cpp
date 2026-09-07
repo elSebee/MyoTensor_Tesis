@@ -16,9 +16,9 @@ static float state_notch60[2] = {0.0f, 0.0f};
 static float coeffs_hpf20[5] = {0.9565f, -1.9131f, 0.9565f, -1.9112f, 0.9150f};
 static float state_hpf20[2] = {0.0f, 0.0f};
 
-// LPF 500 Hz
-static float coeffs_lpf500[5] = {0.2929f, 0.5858f, 0.2929f, 0.0f, 0.0f};
-static float state_lpf500[2] = {0.0f, 0.0f};
+// LPF 400 Hz
+static float coeffs_lpf400[5] = {0.6389f, 1.2779f, 0.6389f, 1.1430f, 0.4128f};
+static float state_lpf400[2] = {0.0f, 0.0f};
 
 void dsp_init() {
     // Inicializar estados a cero
@@ -26,7 +26,7 @@ void dsp_init() {
         state_notch50[i] = 0.0f;
         state_notch60[i] = 0.0f;
         state_hpf20[i] = 0.0f;
-        state_lpf500[i] = 0.0f;
+        state_lpf400[i] = 0.0f;
     }
 }
 
@@ -45,6 +45,6 @@ void dsp_process_block(const float *input, float *output, int len) {
     // 3. HPF 20 Hz
     dsps_biquad_f32_ae32(temp2, temp1, len, coeffs_hpf20, state_hpf20);
     
-    // 4. LPF 500 Hz
-    dsps_biquad_f32_ae32(temp1, output, len, coeffs_lpf500, state_lpf500);
+    // 4. LPF 400 Hz
+    dsps_biquad_f32_ae32(temp1, output, len, coeffs_lpf400, state_lpf400);
 }

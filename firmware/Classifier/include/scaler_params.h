@@ -1,14 +1,19 @@
 #pragma once
 /*
  * =============================================================
- *  scaler_params.h — Parámetros de normalización del StandardScaler
+ *  model_config.h — Configuración Dinámica Autogenerada
+ *  Generado automáticamente desde el pipeline de Python
  * =============================================================
  */
 
-// Medias de las características (MAV, RMS, WL, ZC, SSC, VAR)
-const float feature_means[6] = { 0.29915272f, 0.38865380f, 54.49609358f, 62.73089905f, 80.85946609f, 0.19429551f };
+// Parámetros de Ventana
+#define MODEL_WINDOW_SIZE      200
+#define MODEL_WINDOW_STRIDE    100
 
-// Desviaciones estándar de las características (MAV, RMS, WL, ZC, SSC, VAR)
-const float feature_stds[6] = { 0.14838732f, 0.20737231f, 21.23280157f, 12.77665914f, 5.50626956f, 0.23211395f };
+// Calibración de Fábrica de la Sesión
+#define MODEL_MVC_VOLTAGE_V    189.84517f
+#define MODEL_NOISE_THRESHOLD  0.07440f
 
-
+// Parámetros del StandardScaler (MAV, RMS, WL, ZC, SSC, VAR)
+const float feature_means[6] = { 0.20749316f, 0.26569015f, 42.18455848f, 49.68233343f, 91.82361073f, 0.10258632f };
+const float feature_stds[6]  = { 0.14546442f, 0.20518429f, 35.28810429f, 26.82730279f, 21.93785341f, 0.22838535f };

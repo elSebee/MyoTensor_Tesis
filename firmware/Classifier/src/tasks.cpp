@@ -1,10 +1,10 @@
 /*
  * ============================================================
- *  tasks.cpp — Tasks FreeRTOS (Modo Inferencia)
+ *  tasks.cpp — Coordinador FreeRTOS con Emisión ESP-NOW y UDP
  * ============================================================
  *
- *  Core 1 — taskAcquisicion : ADC + DSP a 1kHz → buffer circular PSRAM
- *  Core 0 — taskInferencia  : Extracción de Características + Inferencia
+ *  Core 1 — taskAcquisicion : ADC + DSP (1kHz) + Calibración On-Device
+ *  Core 0 — taskInferencia  : Windowing + Model + Votación + ESP-NOW + UDP
  * ============================================================
  */
 
@@ -12,26 +12,16 @@
 #include "adc.h"
 #include "config.h"
 #include "dsp.h"
-#include "features.h"
-#include <cmath>
+#include "majority_voting.h"
+#include "model_engine.h"
+#include "esp_now_sender.h"
 #include <WiFi.h>
 #include <WiFiUdp.h>
-
-#if defined(MODEL_TYPE_SVM)
-#include "svm_model.h"
-#elif defined(MODEL_TYPE_RF)
-#include "rf_model.h"
-#elif defined(MODEL_TYPE_CNN)
-#include "NN_model.h"
-#include "cnn_scaler_params.h"
-#include "esp_heap_caps.h"
-#include "tensorflow/lite/micro/all_ops_resolver.h"
-#include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/schema/schema_generated.h"
-#endif
+#include <Preferences.h>
+#include <cmath>
 
 // ============================================================
-// Estado compartido entre cores (SPSC lock-free)
+// Variables Globales y Estado Compartido
 // ============================================================
 RingSample ring[RING_SIZE];
 volatile uint32_t ring_head = 0;
@@ -40,52 +30,45 @@ volatile uint32_t g_dropped = 0;
 float *inferBuf = nullptr;
 TaskHandle_t hTaskInferencia = nullptr;
 WiFiUDP udp;
+Preferences prefs;
 
-// ── Filtro de Votación Mayoritaria (Majority Vote) con BUFFER_SIZE = 5 ──
-int majority_vote(int new_prediction) {
-  static int vote_buffer[5] = {0, 0, 0, 0, 0};
-  static int buffer_idx = 0;
+// Parámetros de Calibración Activos (RAM + NVS Flash)
+float g_active_mvc = MODEL_MVC_VOLTAGE_V;
+float g_active_noise = MODEL_NOISE_THRESHOLD;
 
-  // Insertar nueva predicción en el buffer circular
-  vote_buffer[buffer_idx] = new_prediction;
-  buffer_idx = (buffer_idx + 1) % 5;
+// Estado de la Máquina de Calibración
+enum CalibState {
+  CALIB_NONE,
+  CALIB_REST,
+  CALIB_MVC,
+  CALIB_DONE
+};
 
-  // Contar frecuencias para las 4 clases (Reposo, Palma, Puño, Paz)
-  int counts[4] = {0, 0, 0, 0};
-  for (int i = 0; i < 5; i++) {
-    int pred = vote_buffer[i];
-    if (pred >= 0 && pred < 4) {
-      counts[pred]++;
-    }
-  }
+volatile CalibState g_calib_state = CALIB_NONE;
+volatile uint32_t g_calib_samples_count = 0;
+static float g_calib_sum_sq = 0.0f;
+static float g_calib_sum = 0.0f;
+static float g_calib_max_rms = 0.0f;
 
-  // Encontrar la moda estadística
-  int mode_class = 0;
-  int max_count = -1;
-  for (int c = 0; c < 4; c++) {
-    if (counts[c] > max_count) {
-      max_count = counts[c];
-      mode_class = c;
-    }
-  }
-  return mode_class;
-}
+// Instancia de Votación Mayoritaria (N=5, 4 clases)
+static MajorityVote<5, 4> g_majority_voter;
 
 // ============================================================
-// tasksInit — Alojar buffers en PSRAM e inicializar ring buffer
+// Inicialización de Tareas y Memoria
 // ============================================================
 bool tasksInit() {
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, HIGH); // Apagado inicial
+
   ring_head = 0;
   ring_tail = 0;
   g_dropped = 0;
 
   if (!psramFound()) {
     Serial.println("[ERROR] PSRAM no detectada.");
-    Serial.println(
-        "        Verificar: board_build.arduino.memory_type = qio_opi");
     return false;
   }
-  Serial.printf("[OK] PSRAM: %u bytes disponibles\n", ESP.getPsramSize());
+  Serial.printf("[OK] PSRAM disponible: %u bytes\n", ESP.getPsramSize());
 
   inferBuf = (float *)ps_malloc(WINDOW_SIZE * sizeof(float));
   if (!inferBuf) {
@@ -94,221 +77,207 @@ bool tasksInit() {
   }
   memset(inferBuf, 0, WINDOW_SIZE * sizeof(float));
 
-  Serial.printf("[OK] Ring buffer : %u slots x %u bytes = %u bytes SRAM\n",
-                RING_SIZE, (unsigned)sizeof(RingSample),
-                RING_SIZE * (unsigned)sizeof(RingSample));
-  Serial.printf("[OK] Buffer de Inferencia PSRAM: %d bytes\n",
-                WINDOW_SIZE * (int)sizeof(float));
+  // Cargar calibración previa desde memoria Flash NVS
+  prefs.begin("myotensor", false);
+  g_active_mvc = prefs.getFloat("mvc", MODEL_MVC_VOLTAGE_V);
+  g_active_noise = prefs.getFloat("noise", MODEL_NOISE_THRESHOLD);
+  Serial.printf("[CALIB] Calibración Activa -> MVC: %.5f | Ruido: %.5f\n", g_active_mvc, g_active_noise);
+
+  // Inicializar Emisor ESP-NOW Inalámbrico (<1 ms hacia la prótesis)
+  esp_now_sender_init();
+
+  dsp_init();
+  Serial.println("[OK] Filtros DSP SIMD inicializados");
   return true;
 }
 
+void trigger_calibration() {
+  g_calib_sum = 0.0f;
+  g_calib_sum_sq = 0.0f;
+  g_calib_max_rms = 0.0f;
+  g_calib_samples_count = 0;
+  g_calib_state = CALIB_REST;
+  Serial.println("[CALIB] Iniciando Fase 1: Medición de Reposo (2 segundos)...");
+}
+
 // ============================================================
-// CORE 1 — taskAcquisicion
+// CORE 1 — taskAcquisicion (1 kHz)
 // ============================================================
 void taskAcquisicion(void *pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xPeriod = pdMS_TO_TICKS(1000 / FS_HZ);
 
-  Serial.println("[ACQ] Core 1 — adquisicion @ 1kHz");
-  dsp_init(); // Inicializar estados de los filtros IIR
+  Serial.println("[ACQ] Core 1 — Adquisición Vectorizada @ 1kHz iniciada");
 
-  float raw_block[WINDOW_STRIDE];
-  float filtered_block[WINDOW_STRIDE];
-  int block_idx = 0;
+  static float raw_batch[WINDOW_STRIDE];
+  static uint32_t ts_batch[WINDOW_STRIDE];
+  static int batch_idx = 0;
 
   for (;;) {
-    // 1. Leer ADC y quitar DC Offset
     int raw = readADC(EMG_CHANNEL);
-    raw_block[block_idx++] = (float)raw - DC_OFFSET;
+    float centered = (float)raw - DC_OFFSET;
 
-    // 2. Al llenar el bloque, aplicar DSP vectorial (SIMD)
-    if (block_idx == WINDOW_STRIDE) {
-      dsp_process_block(raw_block, filtered_block, WINDOW_STRIDE);
+    raw_batch[batch_idx] = centered;
+    ts_batch[batch_idx] = (uint32_t)micros();
+    batch_idx++;
 
-      uint32_t h = ring_head;
-      for (int i = 0; i < WINDOW_STRIDE; i++) {
-        if ((h - ring_tail) < RING_SIZE) {
-          ring[h & RING_MASK].timestamp_us = (uint32_t)micros();
-          ring[h & RING_MASK].filtered = filtered_block[i];
-          h++;
-        } else {
-          g_dropped++;
+    // ── Máquina de Estados de Calibración en Vivo ──
+    if (g_calib_state == CALIB_REST) {
+      g_calib_sum += centered;
+      g_calib_sum_sq += centered * centered;
+      g_calib_samples_count++;
+
+      if ((g_calib_samples_count % 250) == 0) {
+        digitalWrite(PIN_LED, !digitalRead(PIN_LED));
+      }
+
+      if (g_calib_samples_count >= 2000) { // 2 segundos
+        float mean = g_calib_sum / 2000.0f;
+        float var = (g_calib_sum_sq / 2000.0f) - (mean * mean);
+        float noise_std = sqrtf((var > 0.0f) ? var : 0.0f);
+        
+        g_active_noise = noise_std / ((g_active_mvc > 1.0f) ? g_active_mvc : 189.84f);
+        
+        Serial.printf("[CALIB] Fase 1 Completa -> Ruido Raw STD: %.3f\n", noise_std);
+        Serial.println("[CALIB] Iniciando Fase 2: Contrae con fuerza por 2 segundos...");
+        
+        g_calib_sum = 0.0f;
+        g_calib_sum_sq = 0.0f;
+        g_calib_samples_count = 0;
+        g_calib_state = CALIB_MVC;
+        digitalWrite(PIN_LED, LOW);
+      }
+    } else if (g_calib_state == CALIB_MVC) {
+      g_calib_sum_sq += centered * centered;
+      g_calib_samples_count++;
+
+      if ((g_calib_samples_count % 100) == 0) {
+        float win_rms = sqrtf(g_calib_sum_sq / 100.0f);
+        if (win_rms > g_calib_max_rms) {
+          g_calib_max_rms = win_rms;
         }
+        g_calib_sum_sq = 0.0f;
       }
 
-      // Barrera de memoria (asegura escritura antes de actualizar head)
-      __asm__ volatile("" ::: "memory");
-      ring_head = h;
+      if (g_calib_samples_count >= 2000) {
+        if (g_calib_max_rms < 10.0f) g_calib_max_rms = MODEL_MVC_VOLTAGE_V;
+        
+        // Factor de confort del 80%
+        g_active_mvc = g_calib_max_rms * 0.80f;
 
-      // 3. Notificar a Core 0 si hay una ventana de 300 muestras lista
-      if ((ring_head - ring_tail) >= WINDOW_SIZE) {
-        xTaskNotifyGive(hTaskInferencia);
+        prefs.putFloat("mvc", g_active_mvc);
+        prefs.putFloat("noise", g_active_noise);
+
+        Serial.println("[CALIB] Calibración Completada con Éxito!");
+        Serial.printf("[CALIB] -> MVC Pico: %.3f | MVC Activo (80%%): %.3f | Ruido: %.5f\n",
+                      g_calib_max_rms, g_active_mvc, g_active_noise);
+
+        for (int b = 0; b < 3; b++) {
+          digitalWrite(PIN_LED, HIGH); vTaskDelay(pdMS_TO_TICKS(50));
+          digitalWrite(PIN_LED, LOW);  vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        digitalWrite(PIN_LED, HIGH);
+
+        g_calib_state = CALIB_DONE;
       }
-
-      // Reiniciar índice del bloque
-      block_idx = 0;
     }
 
-    // 4. Esperar al siguiente tick de 1 ms
+    // ── Pipeline por Bloques ──
+    if (batch_idx == WINDOW_STRIDE) {
+      float filtered_batch[WINDOW_STRIDE];
+      dsp_process_block(raw_batch, filtered_batch, WINDOW_STRIDE);
+
+      uint32_t h = ring_head;
+      if ((h - ring_tail) + WINDOW_STRIDE <= RING_SIZE) {
+        for (int i = 0; i < WINDOW_STRIDE; i++) {
+          ring[(h + i) & RING_MASK].timestamp_us = ts_batch[i];
+          ring[(h + i) & RING_MASK].filtered = filtered_batch[i];
+        }
+
+        __asm__ volatile("" ::: "memory");
+        ring_head = h + WINDOW_STRIDE;
+
+        if ((ring_head - ring_tail) >= WINDOW_SIZE) {
+          xTaskNotifyGive(hTaskInferencia);
+        }
+      } else {
+        g_dropped += WINDOW_STRIDE;
+      }
+      batch_idx = 0;
+    }
+
     vTaskDelayUntil(&xLastWakeTime, xPeriod);
   }
 }
 
 // ============================================================
-// CORE 0 — taskInferencia
+// CORE 0 — taskInferencia (Windowing + Model + ESP-NOW + UDP)
 // ============================================================
 void taskInferencia(void *pvParameters) {
-  
-  // ==========================================
-  // CONFIGURACIÓN INICIAL (Fuera del Bucle)
-  // ==========================================
-#if defined(MODEL_TYPE_SVM)
-  Eloquent::ML::Port::SVM svm;
-  float raw_features[6];
-  float scaled_features[6];
-  Serial.println("[INF-SVM] Core 0 — Task inferencia SVM iniciada");
-
-#elif defined(MODEL_TYPE_RF)
-  Eloquent::ML::Port::RandomForest rf;
-  float raw_features[6];
-  Serial.println("[INF-RF] Core 0 — Task inferencia RF iniciada");
-
-#elif defined(MODEL_TYPE_CNN)
-  Serial.println("[INF-CNN] Task inferencia CNN (TFLite Micro) iniciada");
-  Serial.flush();
-  vTaskDelay(pdMS_TO_TICKS(100));
-
-  const tflite::Model *model = tflite::GetModel(g_model_data);
-  if (model->version() != TFLITE_SCHEMA_VERSION) {
-    Serial.printf("[ERROR] Model schema version mismatch.\n");
+  if (!model_init()) {
+    Serial.println("[FATAL] Falló la inicialización del motor de inferencia!");
     vTaskDelete(NULL);
   }
 
-  static tflite::AllOpsResolver resolver;
-  constexpr int kTensorArenaSize = 500 * 1024;
-  static uint8_t *tensor_arena = nullptr;
-  if (!tensor_arena) {
-    tensor_arena = (uint8_t *)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_SPIRAM);
-    if (!tensor_arena) {
-      Serial.println("[ERROR] Fallo al alojar tensor_arena!");
-      vTaskDelete(NULL);
-    }
-  }
-
-  static tflite::MicroInterpreter interpreter(model, resolver, tensor_arena, kTensorArenaSize);
-  TfLiteStatus allocate_status = interpreter.AllocateTensors();
-  if (allocate_status != kTfLiteOk) {
-    Serial.println("[ERROR] AllocateTensors() falló!");
-    vTaskDelete(NULL);
-  }
-
-  TfLiteTensor *input = interpreter.input(0);
-  TfLiteTensor *output = interpreter.output(0);
-  float input_scale = input->params.scale;
-  int32_t input_zero_point = input->params.zero_point;
-  
-  // ======================================================================
-  // [OPTIMIZACIÓN DE HW]: Pre-calcular factores de escala para evitar 
-  // divisiones lentas por cada muestra en el ciclo de inferencia.
-  // formula original: val = (raw - mean) / std; q = val / scale + z_point
-  // formula rápida: q = raw * (1 / (std*scale)) + (z_point - mean / (std*scale))
-  // ======================================================================
-  const float cnn_inv_scale = 1.0f / (signal_std * input_scale);
-  const float cnn_offset = -(signal_mean * cnn_inv_scale) + input_zero_point;
-  
-  Serial.printf("[INF-CNN] TFLite inicializado. Scale: %.6f, ZeroPoint: %d\n", input_scale, input_zero_point);
-#else
-  Serial.println("[INF] Core 0 — Ningún modelo especificado");
-#endif
-
+  static IPAddress udp_target_ip(255, 255, 255, 255);
   if (WiFi.status() == WL_CONNECTED) {
     udp.begin(UDP_PORT);
-    Serial.printf("[WiFi] Servidor UDP iniciado en puerto %d\n", UDP_PORT);
+    Serial.printf("[WiFi] Servidor UDP listo en puerto %d\n", UDP_PORT);
   }
 
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
+    // ── Receptor de Comandos UDP ──
+    int rx_size = udp.parsePacket();
+    if (rx_size > 0) {
+      char rx_buf[32] = {0};
+      int len = udp.read(rx_buf, sizeof(rx_buf) - 1);
+      udp_target_ip = udp.remoteIP();
+
+      if (len > 0) {
+        if (strncmp(rx_buf, "CMD_CALIB", 9) == 0) {
+          trigger_calibration();
+        } else if (strncmp(rx_buf, "CMD_RESET", 9) == 0) {
+          prefs.putFloat("mvc", MODEL_MVC_VOLTAGE_V);
+          prefs.putFloat("noise", MODEL_NOISE_THRESHOLD);
+          g_active_mvc = MODEL_MVC_VOLTAGE_V;
+          g_active_noise = MODEL_NOISE_THRESHOLD;
+          g_majority_voter.reset();
+          Serial.println("[CALIB] Calibración restaurada a valores de fábrica.");
+        }
+      }
+    }
+
+    // ── Control Anti-Lag ──
+    uint32_t cur_head = ring_head;
+    if ((cur_head - ring_tail) > (WINDOW_SIZE + WINDOW_STRIDE)) {
+      ring_tail = cur_head - WINDOW_SIZE;
+    }
+
     while ((ring_head - ring_tail) >= WINDOW_SIZE) {
       uint32_t t = ring_tail;
 
-      // ==========================================
-      // MÓDULO 1: Window Manager
-      // ==========================================
+      float current_mvc = (g_active_mvc > 1.0f) ? g_active_mvc : 189.84517f;
       for (int i = 0; i < WINDOW_SIZE; i++) {
-        inferBuf[i] = ring[(t + i) & RING_MASK].filtered / MVC_VOLTAGE_V;
+        inferBuf[i] = ring[(t + i) & RING_MASK].filtered / current_mvc;
       }
+
       __asm__ volatile("" ::: "memory");
       ring_tail = t + WINDOW_STRIDE;
 
-      int raw_prediction = 0;
+      // 1. Inferencia del Modelo
+      float mav = 0.0f;
+      float rms = 0.0f;
+      int raw_prediction = model_predict(inferBuf, WINDOW_SIZE, mav, rms);
 
-      // ==========================================
-      // MÓDULO 2: Feature Extractor
-      // (Se omite para CNN para ahorrar CPU)
-      // ==========================================
-#if defined(MODEL_TYPE_SVM) || defined(MODEL_TYPE_RF)
-      raw_features[0] = compute_mav(inferBuf, WINDOW_SIZE);
-      raw_features[1] = compute_rms(inferBuf, WINDOW_SIZE);
-      raw_features[2] = compute_wl(inferBuf, WINDOW_SIZE);
-      raw_features[3] = compute_zc(inferBuf, WINDOW_SIZE, NOISE_THRESHOLD);
-      raw_features[4] = compute_ssc(inferBuf, WINDOW_SIZE, NOISE_THRESHOLD);
-      raw_features[5] = compute_var(inferBuf, WINDOW_SIZE);
-#endif
+      // 2. Votación Mayoritaria (N=5)
+      int filtered_prediction = g_majority_voter.update(raw_prediction);
 
-      // ==========================================
-      // MÓDULO 3: Motor de Inferencia
-      // ==========================================
-#if defined(MODEL_TYPE_SVM)
-      scale_features(raw_features, scaled_features);
-      raw_prediction = svm.predict(scaled_features);
+      // 3. Transmisión Inalámbrica Ultrarrápida ESP-NOW (<1 ms) al DevKit de la Prótesis
+      esp_now_send_gesture((uint8_t)filtered_prediction, (uint8_t)raw_prediction, mav, rms);
 
-#elif defined(MODEL_TYPE_RF)
-      // RF no requiere escalado de características
-      raw_prediction = rf.predict(raw_features);
-
-#elif defined(MODEL_TYPE_CNN)
-      int8_t *input_data = input->data.int8;
-      for (int i = 0; i < WINDOW_SIZE; i++) {
-        // [OPTIMIZACIÓN]: Fusión de escalado Z-Score + Cuantización INT8.
-        // Utiliza una sola instrucción fma (fused multiply-add) del ESP32-S3 y
-        // casteo rápido truncando en lugar de usar librerías <cmath> pesadas.
-        float raw_val = inferBuf[i];
-        float scaled_val = raw_val * cnn_inv_scale + cnn_offset;
-        int32_t q = (int32_t)(scaled_val + (scaled_val >= 0 ? 0.5f : -0.5f));
-        
-        // Saturación rápida por ifs (más rápido que std::min/max)
-        if (q < -128) q = -128;
-        else if (q > 127) q = 127;
-        
-        input_data[i] = (int8_t)q;
-      }
-
-      if (interpreter.Invoke() != kTfLiteOk) {
-        Serial.println("[ERROR] Invoke falló!");
-        continue;
-      }
-
-      int8_t *output_data = output->data.int8;
-      int max_idx = 0;
-      int8_t max_val = output_data[0];
-      for (int c = 1; c < 4; c++) {
-        if (output_data[c] > max_val) {
-          max_val = output_data[c];
-          max_idx = c;
-        }
-      }
-      raw_prediction = max_idx;
-#endif
-
-      // ==========================================
-      // MÓDULO 4: Post-procesamiento
-      // ==========================================
-      int filtered_prediction = majority_vote(raw_prediction);
-
-      // ==========================================
-      // MÓDULO 5: Control Actuador y UDP
-      // ==========================================
+      // 4. Enviar Paquete UDP a la PC para el Monitor
       if (WiFi.status() == WL_CONNECTED) {
         struct __attribute__((packed)) {
           uint8_t filtered_prediction;
@@ -319,37 +288,18 @@ void taskInferencia(void *pvParameters) {
 
         packet.filtered_prediction = (uint8_t)filtered_prediction;
         packet.raw_prediction = (uint8_t)raw_prediction;
-        packet.mav = compute_mav(inferBuf, WINDOW_SIZE);
-        packet.rms = compute_rms(inferBuf, WINDOW_SIZE);
+        packet.mav = mav;
+        packet.rms = rms;
 
-        udp.beginPacket(UDP_BROADCAST_IP, UDP_PORT);
-        udp.write((const uint8_t*)&packet, sizeof(packet));
+        udp.beginPacket(udp_target_ip, UDP_PORT);
+        udp.write((const uint8_t *)&packet, sizeof(packet));
         udp.endPacket();
       }
 
-      // [PENDIENTE] Control I2C Servomotores 
-      // if (filtered_prediction == 1) { setServoAngle(180); } ...
-
-      // Impresión en Monitor Serie
-      const char *gesture_names[] = {"REPOSO", "PALMA", "PUNO", "PAZ"};
-#if defined(MODEL_TYPE_CNN)
-      Serial.printf("[INF-CNN] Crudo: %-6s (%d) | Suavizado: %-6s (%d) | Out "
-                    "Prob: [%d, %d, %d, %d]\n",
-                    gesture_names[raw_prediction], raw_prediction,
-                    gesture_names[filtered_prediction], filtered_prediction,
-                    output->data.int8[0], output->data.int8[1],
-                    output->data.int8[2], output->data.int8[3]);
-#else
-      Serial.printf("[INF] Crudo: %-6s (%d) | Suavizado: %-6s (%d) | MAV: %.4f "
-                    "| RMS: %.4f\n",
-                    gesture_names[raw_prediction], raw_prediction,
-                    gesture_names[filtered_prediction], filtered_prediction,
-                    compute_mav(inferBuf, WINDOW_SIZE),
-                    compute_rms(inferBuf, WINDOW_SIZE));
-#endif
-      
-      // Ceder CPU
-      vTaskDelay(pdMS_TO_TICKS(1));
+      // 5. Depuración Serie
+      if (Serial) {
+        model_log_debug(raw_prediction, filtered_prediction, mav, rms);
+      }
     }
   }
 }

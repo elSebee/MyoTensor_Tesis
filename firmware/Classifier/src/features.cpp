@@ -1,5 +1,5 @@
 #include "features.h"
-#include "scaler_params.h"
+#include "model_config.h"
 #include "esp_dsp.h"
 #include <cmath>
 
@@ -94,9 +94,10 @@ float compute_var(const float *x, int w) {
   // Producto punto vectorial usando SIMD
   dsps_dotprod_f32(x, x, &sum_sq, w);
   
-  // Fórmula optimizada O(1) de Varianza Muestral sin iterar nuevamente: 
-  // Var = (Sum(X^2) - N * Mean^2) / (N - 1)
-  return (sum_sq - w * mean * mean) / (w - 1);
+  // Fórmula optimizada O(1) de Varianza Poblacional idéntica a np.var(x):
+  // Var = (Sum(X^2) - N * Mean^2) / N
+  float var_val = (sum_sq - w * mean * mean) / w;
+  return (var_val < 0.0f) ? 0.0f : var_val;
 }
 
 void scale_features(const float *raw_feats, float *scaled_feats) {

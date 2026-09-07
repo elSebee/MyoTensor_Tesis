@@ -1,13 +1,14 @@
 #pragma once
 /*
  * ============================================================
- *  features.h — Extracción de Características Temporales
+ *  features.h — Prototipos para Extraccion de Caracteristicas
  * ============================================================
  */
 
-#include <Arduino.h>
+#include "config.h"
 
-const float NOISE_THRESHOLD = 0.005f;
+// Umbral de ruido dinamico heredado de model_config.h
+#define NOISE_THRESHOLD MODEL_NOISE_THRESHOLD
 
 float compute_mav(const float *x, int w);
 float compute_rms(const float *x, int w);

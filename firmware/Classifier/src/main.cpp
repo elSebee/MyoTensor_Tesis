@@ -12,37 +12,43 @@
  *    adc       — lectura MCP3208 via SPI
  *    dsp       — filtros IIR EMG (Notch, HPF, LPF)
  *    tasks     — FreeRTOS Core 0 (inferencia) + Core 1 (ADC/DSP)
- *    pca9685   — driver servos MG996R via I2C [pendiente]
  * ============================================================
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
+#include <esp_wifi.h>
 #include "config.h"
 #include "adc.h"
 #include "tasks.h"
 #include "secrets.h"
-// #include "pca9685.h"  // [pendiente — control de servos]
 
 void setup() {
   Serial.begin(921600);
-  delay(500);
+  delay(1000);
   Serial.println("\n=== Classifier — MyoTensor S3 ===");
 
-  // --- Conectar a WiFi ---
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.printf("[WiFi] Conectando a %s", WIFI_SSID);
-  unsigned long start_ms = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - start_ms < WIFI_TIMEOUT_MS)) {
-    delay(500);
-    Serial.print(".");
+  // --- WiFi via WiFiManager ---
+  WiFiManager wm;
+  // wm.resetSettings();
+
+  wm.setConfigPortalTimeout(180);
+  Serial.println("[WiFi] Iniciando autoConnect...");
+  if (!wm.autoConnect("MyoTensor_Classifier")) {
+    Serial.println("[ERROR] Fallo la conexion o se alcanzo el timeout del portal");
+    delay(3000);
+    ESP.restart();
   }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[OK] WiFi conectado! IP: %s\n", WiFi.localIP().toString().c_str());
-    WiFi.setSleep(false); // Desactivar sleep para menor latencia UDP
-  } else {
-    Serial.println("\n[WARNING] No se pudo conectar a WiFi. Operando en modo Offline.");
-  }
+  wm.stopWebPortal();
+  Serial.printf("\n[OK] WiFi conectado a %s — IP: %s | Portal detenido\n",
+                WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+
+  // Optimizaciones WiFi
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  Serial.println("[OK] WiFi Power Save desactivado y potencia ajustada a 8.5dBm");
 
   // --- Hardware ---
   adcInit();
@@ -54,11 +60,8 @@ void setup() {
     while (true) delay(1000);
   }
 
-  // --- PCA9685 — control de servos [pendiente] ---
   // Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-  // pca9685Init();
   // for (uint8_t ch = 0; ch < 6; ch++) setServoAngle(ch, 90.0f);
-  // Serial.println("[OK] PCA9685 (I2C) iniciado");
 
   // --- Core 1: Adquisicion EMG + DSP ---
   xTaskCreatePinnedToCore(
