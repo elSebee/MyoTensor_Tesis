@@ -22,8 +22,14 @@ from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score,
     confusion_matrix, classification_report
 )
-from sklearn.model_selection import StratifiedKFold
+import warnings
 from .. import config
+from ..cv import grouped_cv, grouped_val_split
+
+# Momentum de BatchNorm: con el default de Keras (0.99) las estadísticas móviles no convergen
+# en los ~60 pasos/época de un sujeto y el modelo colapsa a una clase en inferencia
+# (y en la cuantización INT8, que fusiona BN con esas estadísticas).
+BN_MOMENTUM = 0.9
 
 def build_model(
     window_size: Optional[int] = None, 
@@ -54,7 +60,7 @@ def build_model(
             activation="relu",
             name=f"conv1d_{i+1}"
         )(x)
-        x = BatchNormalization(name=f"bn_{i+1}")(x)
+        x = BatchNormalization(momentum=BN_MOMENTUM, name=f"bn_{i+1}")(x)
         x = MaxPooling1D(pool_size=2, name=f"pool_{i+1}")(x)
         x = SpatialDropout1D(dropout_rate, name=f"spatial_dropout_{i+1}")(x)
     
@@ -80,6 +86,7 @@ def train(
     y_train: np.ndarray, 
     validation_data=None, 
     muscle: str = "FDS",
+    groups: Optional[np.ndarray] = None,
     epochs: int = 40, 
     batch_size: int = 32, 
     verbose: int = 0, 
@@ -124,7 +131,17 @@ def train(
             X_val = np.expand_dims(X_val, axis=-1)
         val_tuple = (X_val, y_val)
         X_train_fit, y_train_fit = X_train, y_train
+    elif groups is not None:
+        # Validación interna (EarlyStopping) separada por grupos completos (sets o sujetos)
+        tr_idx, va_idx = grouped_val_split(y_train, groups, val_fraction=0.15)
+        X_train_fit, y_train_fit = X_train[tr_idx], y_train[tr_idx]
+        val_tuple = (X_train[va_idx], y_train[va_idx])
     else:
+        warnings.warn(
+            "train() sin `groups` ni `validation_data`: la validación interna se separa por ventana "
+            "(con solapamiento) y el EarlyStopping queda optimista. Pase groups=WindowSet.groups(...).",
+            UserWarning, stacklevel=2,
+        )
         from sklearn.model_selection import train_test_split
         X_train_fit, X_val, y_train_fit, y_val = train_test_split(
             X_train, y_train, test_size=0.15, random_state=42, stratify=y_train
@@ -174,14 +191,21 @@ def evaluate(model: Model, X_test: np.ndarray, y_test: np.ndarray) -> Dict[str, 
 def tune_hyperparameters(
     X_train: np.ndarray, 
     y_train: np.ndarray, 
+    groups: Optional[np.ndarray] = None,
     param_grid: Optional[Dict[str, Any]] = None, 
     cv: int = 3, 
     epochs: int = 25, 
-    verbose: int = 0
-) -> Tuple[Model, Dict[str, Any], float]:
+    verbose: int = 0,
+    return_cv_results: bool = False
+):
     """
-    Búsqueda en malla para CNN-LSTM mediante K-Fold estratificado.
-    Retorna: (best_model, best_params, best_cv_f1_score)
+    Búsqueda en malla para CNN-LSTM mediante K-Fold estratificado y AGRUPADO.
+
+    `groups` es obligatorio (WindowSet.groups('set') o .groups('subject')): ningún set/sujeto
+    aparece a la vez en entrenamiento y validación. El EarlyStopping de cada fold usa una
+    validación interna separada también por grupos (nunca el fold de evaluación).
+
+    Retorna: (best_model, best_params, best_cv_f1_score[, lista de dicts con F1 por fold])
     """
     if X_train.ndim == 2:
         X_train = np.expand_dims(X_train, axis=-1)
@@ -198,29 +222,37 @@ def tune_hyperparameters(
         keys, values = zip(*param_grid.items())
         param_grid = [dict(zip(keys, v)) for v in itertools.product(*values)]
         
-    skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
+    groups = np.asarray(groups) if groups is not None else None
+    folds = grouped_cv(y_train, groups, n_splits=cv)
     best_score = -1.0
     best_params = {}
     best_model = None
+    cv_records = []
     
     for candidate in param_grid:
         scores = []
-        for train_idx, val_idx in skf.split(X_train, y_train):
-            X_tr, y_tr = X_train[train_idx], y_train[train_idx]
+        for train_idx, val_idx in folds:
+            X_tr, y_tr, g_tr = X_train[train_idx], y_train[train_idx], groups[train_idx]
             X_val, y_val = X_train[val_idx], y_train[val_idx]
             
-            m = train(X_tr, y_tr, validation_data=(X_val, y_val), epochs=epochs, verbose=0, **candidate)
+            # EarlyStopping con validación interna del fold de entrenamiento (no con X_val)
+            m = train(X_tr, y_tr, groups=g_tr, epochs=epochs, verbose=0, **candidate)
             res = evaluate(m, X_val, y_val)
             scores.append(res["f1_macro"])
             
         mean_score = float(np.mean(scores))
+        cv_records.append({"params": dict(candidate), "fold_f1": scores,
+                           "mean_f1": mean_score, "std_f1": float(np.std(scores))})
         if mean_score > best_score:
             best_score = mean_score
             best_params = candidate
             
     # Entrenar modelo final con toda la data
-    best_model = train(X_train, y_train, epochs=epochs + 10, verbose=verbose, **best_params)
-    return best_model, best_params, best_score
+    best_model = train(X_train, y_train, groups=groups, epochs=epochs + 10, verbose=verbose, **best_params)
+    out = (best_model, best_params, best_score)
+    if return_cv_results:
+        out = out + (cv_records,)
+    return out
 
 def quantize(model: Model, X_representative: np.ndarray, filename: str = "cnn_lstm_int8.tflite") -> Tuple[bytes, Dict[str, Any]]:
     """

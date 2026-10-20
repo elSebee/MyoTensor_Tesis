@@ -12,15 +12,31 @@ from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score,
     confusion_matrix, classification_report
 )
-from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 import micromlgen
 from .. import config
+from ..cv import grouped_cv
 
-def train(X_train: np.ndarray, y_train: np.ndarray, validation_data=None, muscle: str = "FDS", **kwargs) -> SVC:
+def _make_pipeline(svc: SVC) -> Pipeline:
+    return Pipeline([("scaler", StandardScaler()), ("svc", svc)])
+
+def split_pipeline(model) -> Tuple[Optional[StandardScaler], SVC]:
+    """Devuelve (scaler, svc). Si el modelo es un SVC suelto, scaler = None."""
+    if isinstance(model, Pipeline):
+        return model.named_steps["scaler"], model.named_steps["svc"]
+    return None, model
+
+def train(X_train: np.ndarray, y_train: np.ndarray, validation_data=None, muscle: str = "FDS",
+          scale: bool = True, **kwargs):
     """
     Entrena un modelo Support Vector Machine (SVM).
     Si no se especifican hiperparámetros en kwargs, hereda automáticamente
     los mejores valores descubiertos en config.py para ese músculo.
+
+    Con scale=True (por defecto) devuelve Pipeline(StandardScaler, SVC): se le entregan
+    las características SIN escalar y el Z-score se ajusta solo con X_train.
     """
     default_params = config.get_model_hyperparams("SVM", muscle=muscle)
     final_params = {**default_params, **kwargs}
@@ -38,19 +54,29 @@ def train(X_train: np.ndarray, y_train: np.ndarray, validation_data=None, muscle
         class_weight=class_weight, 
         random_state=random_state
     )
+    if scale:
+        model = _make_pipeline(model)
     model.fit(X_train, y_train)
     return model
 
 def tune_hyperparameters(
     X_train: np.ndarray, 
     y_train: np.ndarray, 
+    groups: Optional[np.ndarray] = None,
     param_grid: Optional[Dict[str, Any]] = None, 
     cv: int = 5,
-    verbose: int = 0
-) -> Tuple[SVC, Dict[str, Any], float]:
+    verbose: int = 0,
+    return_cv_results: bool = False
+):
     """
     Optimiza hiperparámetros de SVM explorando kernels lineales y no lineales (RBF).
-    Retorna: (best_model, best_params, best_cv_f1_score)
+
+    La validación cruzada es agrupada (StratifiedGroupKFold): `groups` es obligatorio
+    (WindowSet.groups('set') intra-sujeto o .groups('subject') inter-sujeto).
+    El StandardScaler va dentro del Pipeline, así se ajusta en cada fold sin ver la validación.
+    X_train son las características SIN escalar.
+
+    Retorna: (best_model [Pipeline], best_params, best_cv_f1_score[, cv_results_ DataFrame])
     """
     if param_grid is None:
         param_grid = {
@@ -59,19 +85,25 @@ def tune_hyperparameters(
             'gamma': ['scale', 'auto', 0.01, 0.1]
         }
     
-    svm_base = SVC(class_weight='balanced', random_state=42)
-    cv_strategy = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
+    pipe = _make_pipeline(SVC(class_weight='balanced', random_state=42))
+    folds = grouped_cv(y_train, groups, n_splits=cv)
+    pipe_grid = {f"svc__{k}": v for k, v in param_grid.items()}
     
     grid_search = GridSearchCV(
-        estimator=svm_base,
-        param_grid=param_grid,
-        cv=cv_strategy,
+        estimator=pipe,
+        param_grid=pipe_grid,
+        cv=folds,
         scoring='f1_macro',
         n_jobs=-1,
         verbose=verbose
     )
     grid_search.fit(X_train, y_train)
-    return grid_search.best_estimator_, grid_search.best_params_, float(grid_search.best_score_)
+    best_params = {k.replace("svc__", "", 1): v for k, v in grid_search.best_params_.items()}
+    out = (grid_search.best_estimator_, best_params, float(grid_search.best_score_))
+    if return_cv_results:
+        import pandas as pd
+        out = out + (pd.DataFrame(grid_search.cv_results_),)
+    return out
 
 # Alias de compatibilidad
 train_with_gridsearch = tune_hyperparameters
@@ -103,10 +135,11 @@ def evaluate(model: SVC, X_test: np.ndarray, y_test: np.ndarray) -> Dict[str, An
         "classification_report": report
     }
 
-def quantize(model: SVC, X_representative: Optional[np.ndarray] = None, filename: Optional[str] = None) -> Dict[str, Any]:
+def quantize(model, X_representative: Optional[np.ndarray] = None, filename: Optional[str] = None) -> Dict[str, Any]:
     """
     Para SVM, la representación en C++ se genera como pesos float estáticos.
     """
+    _, model = split_pipeline(model)
     return {
         "model_type": "SVM",
         "kernel": model.kernel,
@@ -114,10 +147,19 @@ def quantize(model: SVC, X_representative: Optional[np.ndarray] = None, filename
         "classes": len(model.classes_)
     }
 
-def export_to_c(model: SVC, filename: str = "svm_model.h") -> str:
+def get_scaler_params(model) -> Optional[Dict[str, list]]:
+    """Media y desviación del StandardScaler del Pipeline (para model_config.h del firmware)."""
+    scaler, _ = split_pipeline(model)
+    if scaler is None:
+        return None
+    return {"mean": scaler.mean_.tolist(), "std": scaler.scale_.tolist()}
+
+def export_to_c(model, filename: str = "svm_model.h") -> str:
     """
     Exporta el modelo SVM a código C++ utilizando micromlgen.
+    Si es un Pipeline, exporta solo el SVC; el scaler se obtiene con get_scaler_params().
     """
+    _, model = split_pipeline(model)
     c_code = micromlgen.port(model)
     with open(filename, "w", encoding="utf-8") as f:
         f.write(c_code)

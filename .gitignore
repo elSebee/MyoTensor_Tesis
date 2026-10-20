@@ -97,3 +97,12 @@ test
 docs/
 tools/PlotNeuralNet/
 intelligence/src/experimentos/pruebas.ipynb
+
+# ─── Resultados trazables (Fase 0) ─────────────────────────
+# Se versionan los CSV/JSON de resultados y particiones; modelos y figuras siguen fuera.
+!intelligence/src/experimentos/logs/
+intelligence/src/experimentos/logs/*
+!intelligence/src/experimentos/logs/results/
+!intelligence/src/experimentos/logs/results/**
+!intelligence/src/experimentos/logs/splits/
+!intelligence/src/experimentos/logs/splits/**

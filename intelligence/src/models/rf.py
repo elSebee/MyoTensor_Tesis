@@ -12,9 +12,10 @@ from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score,
     confusion_matrix, classification_report
 )
-from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.model_selection import GridSearchCV
 import micromlgen
 from .. import config
+from ..cv import grouped_cv
 
 def train(X_train: np.ndarray, y_train: np.ndarray, validation_data=None, muscle: str = "FDS", **kwargs) -> RandomForestClassifier:
     """
@@ -45,13 +46,19 @@ def train(X_train: np.ndarray, y_train: np.ndarray, validation_data=None, muscle
 def tune_hyperparameters(
     X_train: np.ndarray, 
     y_train: np.ndarray, 
+    groups: Optional[np.ndarray] = None,
     param_grid: Optional[Dict[str, Any]] = None, 
     cv: int = 5,
-    verbose: int = 0
-) -> Tuple[RandomForestClassifier, Dict[str, Any], float]:
+    verbose: int = 0,
+    return_cv_results: bool = False
+):
     """
     Optimiza y entrena un modelo Random Forest usando GridSearchCV.
-    Retorna: (best_model, best_params, best_cv_f1_score)
+
+    La validación cruzada es agrupada (StratifiedGroupKFold): `groups` es obligatorio
+    (WindowSet.groups('set') intra-sujeto o .groups('subject') inter-sujeto).
+
+    Retorna: (best_model, best_params, best_cv_f1_score[, cv_results_ DataFrame])
     """
     if param_grid is None:
         param_grid = {
@@ -61,18 +68,22 @@ def tune_hyperparameters(
         }
     
     rf_base = RandomForestClassifier(class_weight='balanced', random_state=42, n_jobs=-1)
-    cv_strategy = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
+    folds = grouped_cv(y_train, groups, n_splits=cv)
     
     grid_search = GridSearchCV(
         estimator=rf_base,
         param_grid=param_grid,
-        cv=cv_strategy,
+        cv=folds,
         scoring='f1_macro',
         n_jobs=-1,
         verbose=verbose
     )
     grid_search.fit(X_train, y_train)
-    return grid_search.best_estimator_, grid_search.best_params_, float(grid_search.best_score_)
+    out = (grid_search.best_estimator_, grid_search.best_params_, float(grid_search.best_score_))
+    if return_cv_results:
+        import pandas as pd
+        out = out + (pd.DataFrame(grid_search.cv_results_),)
+    return out
 
 # Alias de compatibilidad
 train_with_gridsearch = tune_hyperparameters
