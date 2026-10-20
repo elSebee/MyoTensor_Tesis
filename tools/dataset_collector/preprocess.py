@@ -218,16 +218,31 @@ def compute_valid_flags(
     stim_col: str   = "restimulus",
     rep_col: str    = "re_repetition_id",
 ) -> np.ndarray:
-    """Marca repeticiones atípicas usando MAD sobre duración y energía."""
-    valid    = np.ones(len(df), dtype=np.int8)
-    restim   = df[stim_col].values
+    """
+    Control de calidad técnico por repetición activa.
+    Identifica y descarta únicamente fallos técnicos reales de hardware o protocolo:
+      1. Duración inverosímil: contracción activa < 1000 ms (trigger espurio) o > 9000 ms (desincronización).
+      2. Electrodo desconectado / Canal muerto: desviación estándar nula o insignificante (std < 1e-4).
+      3. Saturación / Clipping de hardware: señal congelada en el mismo valor por >= 50 ms consecutivos.
+      4. Ausencia total de activación (no-cumplimiento): energía menor al 50% del piso de ruido basal.
     
-    # Usar re_repetition_id si está en el dataframe, sino repetition_id
+    Preserva la variabilidad biológica natural (fuerza, duración voluntaria y fatiga) entre repeticiones sanas.
+    """
+    valid  = np.ones(len(df), dtype=np.int8)
+    restim = df[stim_col].values
+    
     r_col = rep_col if rep_col in df.columns else ("repetition_id" if "repetition_id" in df.columns else "repetition")
     rep   = df[r_col].values
     
-    sig_col  = signal_col if signal_col in df.columns else "filtered"
-    signal   = df[sig_col].values
+    sig_col = signal_col if signal_col in df.columns else "filtered"
+    signal  = df[sig_col].values
+
+    # Estimar piso de ruido basal del reposo si existe
+    rest_mask = (restim == 0)
+    if np.sum(rest_mask) > 100:
+        noise_rms = float(np.sqrt(np.mean(signal[rest_mask] ** 2)))
+    else:
+        noise_rms = 0.0
 
     gesture_ids = [g for g in np.unique(restim) if g != 0]
 
@@ -235,39 +250,37 @@ def compute_valid_flags(
         reps_in_gesture = np.unique(rep[restim == gid])
         reps_in_gesture = reps_in_gesture[reps_in_gesture > 0]
 
-        if len(reps_in_gesture) < 3:
-            continue
-
-        masks     = []
-        durations = []
-        energies  = []
-
         for r in reps_in_gesture:
             mask = (restim == gid) & (rep == r)
-            masks.append(mask)
             seg = signal[mask]
-            durations.append(float(np.sum(mask)))
-            energies.append(float(np.sqrt(np.mean(seg ** 2))) if len(seg) > 0 else 0.0)
+            dur_ms = len(seg)
 
-        durations = np.array(durations)
-        energies  = np.array(energies)
+            # 1. Chequeo de duración inverosímil
+            bad_dur = (dur_ms < 1000) or (dur_ms > 9000)
 
-        med_dur    = np.median(durations)
-        med_energy = np.median(energies)
-        mad_dur    = np.median(np.abs(durations - med_dur))
-        mad_energy = np.median(np.abs(energies  - med_energy))
+            # 2. Chequeo de canal muerto / desconexión
+            bad_flat = (np.std(seg) < 1e-4) if dur_ms > 0 else True
 
-        # Usamos un umbral robusto de Z-score estándar de 3.5 recomendado internacionalmente.
-        # En una distribución normal, 1.4826 * MAD equivale a 1.0 Desviación Estándar.
-        # Esto permite variabilidad natural biológica pero detecta outliers de verdad.
-        thresh_dur = 3.5 * (1.4826 * mad_dur) if mad_dur > 0 else 0.0
-        thresh_energy = 3.5 * (1.4826 * mad_energy) if mad_energy > 0 else 0.0
+            # 3. Chequeo de saturación / clipping prolongado (>= 50 muestras consecutivas idénticas)
+            bad_clip = False
+            if dur_ms >= 50:
+                diffs = np.diff(seg)
+                zero_runs = (diffs == 0).astype(np.int8)
+                if len(zero_runs) >= 50 and np.max(np.convolve(zero_runs, np.ones(50, dtype=int), mode='valid')) >= 50:
+                    bad_clip = True
 
-        for mask, dur, energy in zip(masks, durations, energies):
-            bad_dur    = (thresh_dur > 0) and (abs(dur - med_dur) > thresh_dur)
-            bad_energy = (thresh_energy > 0) and (abs(energy - med_energy) > thresh_energy)
-            if bad_dur or bad_energy:
+            # 4. Chequeo de no-cumplimiento total (energía menor que la mitad del ruido basal)
+            seg_rms = float(np.sqrt(np.mean(seg ** 2))) if dur_ms > 0 else 0.0
+            bad_effort = (noise_rms > 0) and (seg_rms < 0.5 * noise_rms)
+
+            if bad_dur or bad_flat or bad_clip or bad_effort:
                 valid[mask] = 0
+                motivos = []
+                if bad_dur: motivos.append(f"duración={dur_ms}ms")
+                if bad_flat: motivos.append("señal plana/desconectada")
+                if bad_clip: motivos.append("saturación sostenida")
+                if bad_effort: motivos.append(f"energía insuficiente (rms={seg_rms:.4f} vs noise={noise_rms:.4f})")
+                print(f"[QUALITY] Repetición descartada por fallo técnico: Gesto {gid}, Rep {r} -> {', '.join(motivos)}")
 
     return valid
 

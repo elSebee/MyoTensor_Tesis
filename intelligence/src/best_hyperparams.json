@@ -1,0 +1,66 @@
+{
+    "FDS": {
+        "RF": {
+            "max_depth": 15,
+            "min_samples_split": 4,
+            "n_estimators": 150
+        },
+        "SVM": {
+            "C": 50.0,
+            "gamma": 0.1,
+            "kernel": "rbf"
+        },
+        "CNN-LSTM": {
+            "conv_filters": [
+                32,
+                64
+            ],
+            "lstm_units": 64,
+            "dropout_rate": 0.3,
+            "learning_rate": 0.001
+        },
+        "CNN-TCN": {
+            "nb_filters": 32,
+            "kernel_size": 3,
+            "dilations": [
+                1,
+                2,
+                4
+            ],
+            "dropout_rate": 0.2,
+            "learning_rate": 0.001
+        }
+    },
+    "ED": {
+        "RF": {
+            "max_depth": null,
+            "min_samples_split": 4,
+            "n_estimators": 50
+        },
+        "SVM": {
+            "C": 50.0,
+            "gamma": "scale",
+            "kernel": "rbf"
+        },
+        "CNN-LSTM": {
+            "conv_filters": [
+                32,
+                64
+            ],
+            "lstm_units": 64,
+            "dropout_rate": 0.3,
+            "learning_rate": 0.001
+        },
+        "CNN-TCN": {
+            "nb_filters": 32,
+            "kernel_size": 3,
+            "dilations": [
+                1,
+                2,
+                4
+            ],
+            "dropout_rate": 0.2,
+            "learning_rate": 0.001
+        }
+    }
+}
