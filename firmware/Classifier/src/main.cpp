@@ -23,11 +23,19 @@
 #include "adc.h"
 #include "tasks.h"
 #include "secrets.h"
+#include "model_engine.h"
 
 void setup() {
   Serial.begin(921600);
   delay(1000);
   Serial.println("\n=== Classifier — MyoTensor S3 ===");
+
+  // --- Inicialización del Motor de Inferencia ---
+  // Se inicializa antes de WiFi para reservar tensor_arena en SRAM interna contigua libre
+  if (!model_init()) {
+    Serial.println("[FATAL] Falló model_init(). Sistema detenido.");
+    while (true) delay(1000);
+  }
 
   // --- WiFi via WiFiManager ---
   WiFiManager wm;

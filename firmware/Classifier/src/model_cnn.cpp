@@ -21,9 +21,16 @@ static TfLiteTensor *input_tensor = nullptr;
 static TfLiteTensor *output_tensor = nullptr;
 static float cnn_inv_scale = 1.0f;
 static float cnn_offset = 0.0f;
+static bool is_model_initialized = false;
+static float g_last_invoke_ms = 0.0f;
 
 bool model_init() {
+  if (is_model_initialized) return true;
   Serial.println("[MODEL] Inicializando motor CNN/TCN (TFLite Micro)...");
+  
+  size_t free_sram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  Serial.printf("[MODEL] SRAM interna bloque contiguo disponible: %u bytes\n", free_sram_largest);
+
   const tflite::Model *model = tflite::GetModel(g_model_data);
   if (model->version() != TFLITE_SCHEMA_VERSION) {
     Serial.printf("[ERROR] Model schema version mismatch.\n");
@@ -31,19 +38,20 @@ bool model_init() {
   }
 
   static tflite::AllOpsResolver resolver;
-  // Tamaño optimizado para TinyML-TCN SIMD (~30 KB requeridos)
+  // Tamaño optimizado para TinyML-TCN SIMD (~30-48 KB)
   constexpr int kTensorArenaSize = 48 * 1024;
   static uint8_t *tensor_arena = nullptr;
   if (!tensor_arena) {
     // Intentar primero en SRAM interna rápida (240 MHz, 0 wait states) con alineación 16B para SIMD
     tensor_arena = (uint8_t *)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (tensor_arena) {
-      Serial.println("[MODEL] tensor_arena alojado en SRAM INTERNA (Fast SIMD).");
+      Serial.println("[MODEL] tensor_arena alojado en SRAM INTERNA (Fast SIMD - 0 wait states).");
     } else {
       // Fallback a PSRAM externa
+      Serial.println("[WARN] Insuficiente bloque contiguo en SRAM interna! Cayendo a PSRAM externa.");
       tensor_arena = (uint8_t *)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_SPIRAM);
       if (tensor_arena) {
-        Serial.println("[MODEL] tensor_arena alojado en PSRAM (Fallback).");
+        Serial.println("[MODEL] tensor_arena alojado en PSRAM (Fallback - Acceso vía bus SPI).");
       } else {
         Serial.println("[ERROR] Fallo al alojar tensor_arena!");
         return false;
@@ -72,6 +80,7 @@ bool model_init() {
   cnn_offset = -(signal_mean * cnn_inv_scale) + input_zero_point;
 
   Serial.printf("[MODEL] TFLite listo. Scale: %.6f, ZeroPoint: %d\n", input_scale, input_zero_point);
+  is_model_initialized = true;
   return true;
 }
 
@@ -91,7 +100,12 @@ int model_predict(const float *window, int window_size, float &mav, float &rms) 
     input_data[i] = (int8_t)q;
   }
 
-  if (interpreter->Invoke() != kTfLiteOk) {
+  uint32_t t_start = micros();
+  TfLiteStatus invoke_status = interpreter->Invoke();
+  uint32_t dt = micros() - t_start;
+  g_last_invoke_ms = dt / 1000.0f;
+
+  if (invoke_status != kTfLiteOk) {
     return 0;
   }
 
@@ -113,7 +127,8 @@ void model_log_debug(int raw_pred, int filtered_pred, float mav, float rms) {
   const char *filt_name = (filtered_pred >= 0 && filtered_pred < 4) ? gesture_names[filtered_pred] : "DESC";
 
   if (output_tensor) {
-    Serial.printf("[INF-CNN] Crudo: %-6s (%d) | Suavizado: %-6s (%d) | Out Prob: [%d, %d, %d, %d] | MAV: %.4f\n",
+    Serial.printf("[INF-CNN] Inferencia: %5.1f ms | Crudo: %-6s (%d) | Suavizado: %-6s (%d) | Out Prob: [%d, %d, %d, %d] | MAV: %.4f\n",
+                  g_last_invoke_ms,
                   raw_name, raw_pred, filt_name, filtered_pred,
                   output_tensor->data.int8[0], output_tensor->data.int8[1],
                   output_tensor->data.int8[2], output_tensor->data.int8[3],

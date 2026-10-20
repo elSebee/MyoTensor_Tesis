@@ -49,6 +49,7 @@ volatile uint32_t g_calib_samples_count = 0;
 static float g_calib_sum_sq = 0.0f;
 static float g_calib_sum = 0.0f;
 static float g_calib_max_rms = 0.0f;
+static float g_calib_noise_raw_std = 0.0f;
 
 // Instancia de Votación Mayoritaria (N=5, 4 clases)
 static MajorityVote<5, 4> g_majority_voter;
@@ -70,9 +71,12 @@ bool tasksInit() {
   }
   Serial.printf("[OK] PSRAM disponible: %u bytes\n", ESP.getPsramSize());
 
-  inferBuf = (float *)ps_malloc(WINDOW_SIZE * sizeof(float));
+  inferBuf = (float *)heap_caps_malloc(WINDOW_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (!inferBuf) {
-    Serial.println("[ERROR] Fallo al alojar inferBuf en PSRAM");
+    inferBuf = (float *)ps_malloc(WINDOW_SIZE * sizeof(float));
+  }
+  if (!inferBuf) {
+    Serial.println("[ERROR] Fallo al alojar inferBuf");
     return false;
   }
   memset(inferBuf, 0, WINDOW_SIZE * sizeof(float));
@@ -81,6 +85,21 @@ bool tasksInit() {
   prefs.begin("myotensor", false);
   g_active_mvc = prefs.getFloat("mvc", MODEL_MVC_VOLTAGE_V);
   g_active_noise = prefs.getFloat("noise", MODEL_NOISE_THRESHOLD);
+
+  // Sanity check para evitar umbrales corruptos (> 0.10f o < 0.005f) que degradan el clasificador
+  if (g_active_noise > 0.10f || g_active_noise < 0.005f) {
+    Serial.printf("[CALIB] Ruido en Flash fuera de rango (%.5f). Restaurando canonico S01: %.5f\n",
+                  g_active_noise, MODEL_NOISE_THRESHOLD);
+    g_active_noise = MODEL_NOISE_THRESHOLD;
+    prefs.putFloat("noise", MODEL_NOISE_THRESHOLD);
+  }
+  if (g_active_mvc < 100.0f || g_active_mvc > 2000.0f) {
+    Serial.printf("[CALIB] MVC en Flash fuera de rango (%.5f). Restaurando canonico S01: %.5f\n",
+                  g_active_mvc, MODEL_MVC_VOLTAGE_V);
+    g_active_mvc = MODEL_MVC_VOLTAGE_V;
+    prefs.putFloat("mvc", MODEL_MVC_VOLTAGE_V);
+  }
+
   Serial.printf("[CALIB] Calibración Activa -> MVC: %.5f | Ruido: %.5f\n", g_active_mvc, g_active_noise);
 
   // Inicializar Emisor ESP-NOW Inalámbrico (<1 ms hacia la prótesis)
@@ -95,9 +114,10 @@ void trigger_calibration() {
   g_calib_sum = 0.0f;
   g_calib_sum_sq = 0.0f;
   g_calib_max_rms = 0.0f;
+  g_calib_noise_raw_std = 0.0f;
   g_calib_samples_count = 0;
   g_calib_state = CALIB_REST;
-  Serial.println("[CALIB] Iniciando Fase 1: Medición de Reposo (2 segundos)...");
+  Serial.println("[CALIB] Iniciando Fase 1: Medición de Reposo Filtrado (2 segundos)...");
 }
 
 // ============================================================
@@ -121,71 +141,76 @@ void taskAcquisicion(void *pvParameters) {
     ts_batch[batch_idx] = (uint32_t)micros();
     batch_idx++;
 
-    // ── Máquina de Estados de Calibración en Vivo ──
-    if (g_calib_state == CALIB_REST) {
-      g_calib_sum += centered;
-      g_calib_sum_sq += centered * centered;
-      g_calib_samples_count++;
-
-      if ((g_calib_samples_count % 250) == 0) {
-        digitalWrite(PIN_LED, !digitalRead(PIN_LED));
-      }
-
-      if (g_calib_samples_count >= 2000) { // 2 segundos
-        float mean = g_calib_sum / 2000.0f;
-        float var = (g_calib_sum_sq / 2000.0f) - (mean * mean);
-        float noise_std = sqrtf((var > 0.0f) ? var : 0.0f);
-        
-        g_active_noise = noise_std / ((g_active_mvc > 1.0f) ? g_active_mvc : 189.84f);
-        
-        Serial.printf("[CALIB] Fase 1 Completa -> Ruido Raw STD: %.3f\n", noise_std);
-        Serial.println("[CALIB] Iniciando Fase 2: Contrae con fuerza por 2 segundos...");
-        
-        g_calib_sum = 0.0f;
-        g_calib_sum_sq = 0.0f;
-        g_calib_samples_count = 0;
-        g_calib_state = CALIB_MVC;
-        digitalWrite(PIN_LED, LOW);
-      }
-    } else if (g_calib_state == CALIB_MVC) {
-      g_calib_sum_sq += centered * centered;
-      g_calib_samples_count++;
-
-      if ((g_calib_samples_count % 100) == 0) {
-        float win_rms = sqrtf(g_calib_sum_sq / 100.0f);
-        if (win_rms > g_calib_max_rms) {
-          g_calib_max_rms = win_rms;
-        }
-        g_calib_sum_sq = 0.0f;
-      }
-
-      if (g_calib_samples_count >= 2000) {
-        if (g_calib_max_rms < 10.0f) g_calib_max_rms = MODEL_MVC_VOLTAGE_V;
-        
-        // Factor de confort del 80%
-        g_active_mvc = g_calib_max_rms * 0.80f;
-
-        prefs.putFloat("mvc", g_active_mvc);
-        prefs.putFloat("noise", g_active_noise);
-
-        Serial.println("[CALIB] Calibración Completada con Éxito!");
-        Serial.printf("[CALIB] -> MVC Pico: %.3f | MVC Activo (80%%): %.3f | Ruido: %.5f\n",
-                      g_calib_max_rms, g_active_mvc, g_active_noise);
-
-        for (int b = 0; b < 3; b++) {
-          digitalWrite(PIN_LED, HIGH); vTaskDelay(pdMS_TO_TICKS(50));
-          digitalWrite(PIN_LED, LOW);  vTaskDelay(pdMS_TO_TICKS(50));
-        }
-        digitalWrite(PIN_LED, HIGH);
-
-        g_calib_state = CALIB_DONE;
-      }
-    }
-
-    // ── Pipeline por Bloques ──
+    // ── Pipeline por Bloques y Calibración sobre Señal Filtrada ──
     if (batch_idx == WINDOW_STRIDE) {
       float filtered_batch[WINDOW_STRIDE];
       dsp_process_block(raw_batch, filtered_batch, WINDOW_STRIDE);
+
+      // Calibración sobre la señal filtrada libre de ruido de red 50/60 Hz
+      if (g_calib_state == CALIB_REST) {
+        for (int i = 0; i < WINDOW_STRIDE; i++) {
+          float s = filtered_batch[i];
+          g_calib_sum += s;
+          g_calib_sum_sq += s * s;
+        }
+        g_calib_samples_count += WINDOW_STRIDE;
+
+        if ((g_calib_samples_count % 250) == 0) {
+          digitalWrite(PIN_LED, !digitalRead(PIN_LED));
+        }
+
+        if (g_calib_samples_count >= 2000) { // 2 segundos
+          float mean = g_calib_sum / 2000.0f;
+          float var = (g_calib_sum_sq / 2000.0f) - (mean * mean);
+          g_calib_noise_raw_std = sqrtf((var > 0.0f) ? var : 0.0f);
+          
+          Serial.printf("[CALIB] Fase 1 Completa -> Ruido Filtrado STD: %.3f cuentas\n", g_calib_noise_raw_std);
+          Serial.println("[CALIB] Iniciando Fase 2: Contrae con fuerza (MVC) por 2 segundos...");
+          
+          g_calib_sum = 0.0f;
+          g_calib_sum_sq = 0.0f;
+          g_calib_samples_count = 0;
+          g_calib_state = CALIB_MVC;
+          digitalWrite(PIN_LED, LOW);
+        }
+      } else if (g_calib_state == CALIB_MVC) {
+        for (int i = 0; i < WINDOW_STRIDE; i++) {
+          float s = filtered_batch[i];
+          g_calib_sum_sq += s * s;
+        }
+        g_calib_samples_count += WINDOW_STRIDE;
+
+        if ((g_calib_samples_count % 100) == 0) {
+          float win_rms = sqrtf(g_calib_sum_sq / 100.0f);
+          if (win_rms > g_calib_max_rms) {
+            g_calib_max_rms = win_rms;
+          }
+          g_calib_sum_sq = 0.0f;
+        }
+
+        if (g_calib_samples_count >= 2000) {
+          if (g_calib_max_rms < 10.0f) g_calib_max_rms = MODEL_MVC_VOLTAGE_V;
+          
+          // Factor de confort del 80%
+          g_active_mvc = g_calib_max_rms * 0.80f;
+          g_active_noise = g_calib_noise_raw_std / g_active_mvc;
+
+          prefs.putFloat("mvc", g_active_mvc);
+          prefs.putFloat("noise", g_active_noise);
+
+          Serial.println("[CALIB] Calibración Completada con Éxito!");
+          Serial.printf("[CALIB] -> MVC Pico: %.3f | MVC Activo (80%%): %.3f | Ruido Normalizado: %.5f\n",
+                        g_calib_max_rms, g_active_mvc, g_active_noise);
+
+          for (int b = 0; b < 3; b++) {
+            digitalWrite(PIN_LED, HIGH); vTaskDelay(pdMS_TO_TICKS(50));
+            digitalWrite(PIN_LED, LOW);  vTaskDelay(pdMS_TO_TICKS(50));
+          }
+          digitalWrite(PIN_LED, HIGH);
+
+          g_calib_state = CALIB_DONE;
+        }
+      }
 
       uint32_t h = ring_head;
       if ((h - ring_tail) + WINDOW_STRIDE <= RING_SIZE) {
@@ -249,13 +274,30 @@ void taskInferencia(void *pvParameters) {
       }
     }
 
-    // ── Control Anti-Lag ──
-    uint32_t cur_head = ring_head;
-    if ((cur_head - ring_tail) > (WINDOW_SIZE + WINDOW_STRIDE)) {
-      ring_tail = cur_head - WINDOW_SIZE;
+    // ── Receptor de Comandos Serie (USB) ──
+    while (Serial && Serial.available() > 0) {
+      char c = Serial.read();
+      if (c == 'c' || c == 'C') {
+        Serial.println("\n[CMD] Comando de calibración recibido por Serial.");
+        trigger_calibration();
+      } else if (c == 'r' || c == 'R') {
+        prefs.putFloat("mvc", MODEL_MVC_VOLTAGE_V);
+        prefs.putFloat("noise", MODEL_NOISE_THRESHOLD);
+        g_active_mvc = MODEL_MVC_VOLTAGE_V;
+        g_active_noise = MODEL_NOISE_THRESHOLD;
+        g_majority_voter.reset();
+        Serial.println("\n[CMD] Calibración restaurada a valores de fábrica por Serial.");
+      }
     }
 
-    while ((ring_head - ring_tail) >= WINDOW_SIZE) {
+    // ── Control Anti-Lag Estricto en Tiempo Real ──
+    uint32_t cur_head = ring_head;
+    if ((cur_head - ring_tail) >= WINDOW_SIZE) {
+      // Si la cola se atrasó más de un stride, descartamos el backlog para inferir siempre sobre la ventana viva más reciente
+      if ((cur_head - ring_tail) > (WINDOW_SIZE + WINDOW_STRIDE)) {
+        ring_tail = cur_head - WINDOW_SIZE;
+      }
+
       uint32_t t = ring_tail;
 
       float current_mvc = (g_active_mvc > 1.0f) ? g_active_mvc : 189.84517f;
@@ -300,6 +342,11 @@ void taskInferencia(void *pvParameters) {
       if (Serial) {
         model_log_debug(raw_prediction, filtered_prediction, mav, rms);
       }
+
+      // 6. Ceder CPU a IDLE0 para alimentar el Watchdog (evita crash task_wdt abort)
+      vTaskDelay(pdMS_TO_TICKS(15));
+      // Purgar notificaciones acumuladas durante la inferencia para no encadenar llamadas sin reposo
+      ulTaskNotifyTake(pdTRUE, 0);
     }
   }
 }

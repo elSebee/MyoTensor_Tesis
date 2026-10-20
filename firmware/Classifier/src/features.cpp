@@ -62,21 +62,21 @@ float compute_ssc(const float *x, int w, float threshold) {
   // Loop Unrolling 4x
   for (; i <= w - 1 - 4; i += 4) {
     float d1 = x[i] - x[i - 1]; float d2 = x[i + 1] - x[i];
-    if ((d1 * d2 < 0.0f) && (fabsf(d1) > threshold) && (fabsf(d2) > threshold)) count++;
+    if ((d1 * d2 < 0.0f) && ((fabsf(d1) > threshold) || (fabsf(d2) > threshold))) count++;
     
     d1 = x[i+1] - x[i]; d2 = x[i + 2] - x[i+1];
-    if ((d1 * d2 < 0.0f) && (fabsf(d1) > threshold) && (fabsf(d2) > threshold)) count++;
+    if ((d1 * d2 < 0.0f) && ((fabsf(d1) > threshold) || (fabsf(d2) > threshold))) count++;
     
     d1 = x[i+2] - x[i+1]; d2 = x[i + 3] - x[i+2];
-    if ((d1 * d2 < 0.0f) && (fabsf(d1) > threshold) && (fabsf(d2) > threshold)) count++;
+    if ((d1 * d2 < 0.0f) && ((fabsf(d1) > threshold) || (fabsf(d2) > threshold))) count++;
     
     d1 = x[i+3] - x[i+2]; d2 = x[i + 4] - x[i+3];
-    if ((d1 * d2 < 0.0f) && (fabsf(d1) > threshold) && (fabsf(d2) > threshold)) count++;
+    if ((d1 * d2 < 0.0f) && ((fabsf(d1) > threshold) || (fabsf(d2) > threshold))) count++;
   }
   for (; i < w - 1; i++) {
     float d1 = x[i] - x[i - 1];
     float d2 = x[i + 1] - x[i];
-    if ((d1 * d2 < 0.0f) && (fabsf(d1) > threshold) && (fabsf(d2) > threshold)) count++;
+    if ((d1 * d2 < 0.0f) && ((fabsf(d1) > threshold) || (fabsf(d2) > threshold))) count++;
   }
   return (float)count;
 }
