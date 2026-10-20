@@ -92,3 +92,8 @@ pseudocodigos
 test
 .gemini
 .codegraph
+
+# ─── Excluidos por decisión del autor ──────────────────────
+docs/
+tools/PlotNeuralNet/
+intelligence/src/experimentos/pruebas.ipynb
